@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Runs espalier.py in the environment install.sh built.
+here=$(cd "$(dirname "$0")" && pwd)
+exec "$here/.venv/bin/python" "$here/espalier.py" "$@"

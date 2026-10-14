@@ -1,0 +1,113 @@
+diff --git a/cumesh/remeshing.py b/cumesh/remeshing.py
+index 272a6c1..f564a8e 100644
+--- a/cumesh/remeshing.py
++++ b/cumesh/remeshing.py
+@@ -1,4 +1,5 @@
+ from typing import *
++import os
+ import torch
+ from tqdm import tqdm
+ from . import _C
+@@ -187,19 +188,29 @@ def remesh_narrow_band_dc(
+     # -------------------------------------------------------------------------
+     # 6. Topology Generation (Connectivity)
+     # -------------------------------------------------------------------------
+-    # Find connected voxels
+-    edge_neighbor_voxel = coords.reshape(Nvox, 1, 1, 3) + remesh_narrow_band_dc.edge_neighbor_voxel_offset      # (N, 3, 4, 3)
+-    connected_voxel = edge_neighbor_voxel[intersected != 0]                           # (M, 4, 3)
+-    intersected = intersected[intersected != 0]                                       # (M,)
+-    M = connected_voxel.shape[0]
+-    connected_voxel_hash_key = torch.cat([
+-        torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
+-        connected_voxel.reshape(-1, 3)
+-    ], dim=1)
+-    connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap_vox, connected_voxel_hash_key, resolution, resolution, resolution).reshape(M, 4).int()
+-    connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
+-    quad_indices = connected_voxel_indices[connected_voxel_valid].int()                             # (L, 4)
+-    intersected_dir = intersected[connected_voxel_valid].int()
++    # Find connected voxels. Each voxel's quads depend only on that voxel, so this runs over chunks of voxels (the
++    # (N, 3, 4, 3) neighbour tensor is 144 bytes a voxel) and concatenates them in voxel order: the same quads in the
++    # same order as one pass. CUMESH_REMESH_CHUNK sets the voxels per chunk.
++    chunk = int(os.environ.get('CUMESH_REMESH_CHUNK', 4_000_000))
++    quad_chunks, dir_chunks = [], []
++    for s in range(0, Nvox, chunk):
++        c_coords, c_intersected = coords[s:s + chunk], intersected[s:s + chunk]
++        edge_neighbor_voxel = c_coords.reshape(c_coords.shape[0], 1, 1, 3) + remesh_narrow_band_dc.edge_neighbor_voxel_offset      # (n, 3, 4, 3)
++        connected_voxel = edge_neighbor_voxel[c_intersected != 0]                         # (m, 4, 3)
++        c_intersected = c_intersected[c_intersected != 0]                                 # (m,)
++        M = connected_voxel.shape[0]
++        connected_voxel_hash_key = torch.cat([
++            torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
++            connected_voxel.reshape(-1, 3)
++        ], dim=1)
++        connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap_vox, connected_voxel_hash_key, resolution, resolution, resolution).reshape(M, 4).int()
++        connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
++        quad_chunks.append(connected_voxel_indices[connected_voxel_valid].int())        # (l, 4)
++        dir_chunks.append(c_intersected[connected_voxel_valid].int())
++        del edge_neighbor_voxel, connected_voxel, connected_voxel_hash_key, connected_voxel_indices
++    quad_indices = torch.cat(quad_chunks)
++    intersected_dir = torch.cat(dir_chunks)
++    del quad_chunks, dir_chunks
+     L = quad_indices.shape[0]
+     
+     # Remove unreferenced vertices
+@@ -209,28 +220,38 @@ def remesh_narrow_band_dc(
+     vert_map[unique_verts] = torch.arange(unique_verts.shape[0], dtype=torch.int32, device=device)
+     quad_indices = vert_map[quad_indices]
+     
+-    # Construct triangles
++    # The voxel and grid-vertex tables are not used past this point.
++    del hashmap_vox, hashmap_vert, grid_verts, distances_vert, vert_map, unique_verts
++
++    # Construct triangles. Each quad's split depends only on that quad, so this runs over chunks of quads (the same
++    # CUMESH_REMESH_CHUNK) and concatenates them in quad order: the same triangles in the same order as one pass.
+     mesh_vertices = (dual_verts / resolution - 0.5) * scale + center
+-    # if split 1
+-    atempt_triangles_0 = torch.where(
+-        (intersected_dir == 1).unsqueeze(1),
+-        quad_indices[:, remesh_narrow_band_dc.quad_split_1_p],
+-        quad_indices[:, remesh_narrow_band_dc.quad_split_1_n]
+-    )
+-    normals0 = torch.cross(mesh_vertices[atempt_triangles_0[:, 1]] - mesh_vertices[atempt_triangles_0[:, 0]], mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 0]])
+-    normals1 = torch.cross(mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 1]], mesh_vertices[atempt_triangles_0[:, 3]] - mesh_vertices[atempt_triangles_0[:, 1]])
+-    align0 = (normals0 * normals1).sum(dim=1).abs()
+-    # if split 2
+-    atempt_triangles_1 = torch.where(
+-        (intersected_dir == 1).unsqueeze(1),
+-        quad_indices[:, remesh_narrow_band_dc.quad_split_2_p],
+-        quad_indices[:, remesh_narrow_band_dc.quad_split_2_n]
+-    )
+-    normals0 = torch.cross(mesh_vertices[atempt_triangles_1[:, 1]] - mesh_vertices[atempt_triangles_1[:, 0]], mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 0]])
+-    normals1 = torch.cross(mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 1]], mesh_vertices[atempt_triangles_1[:, 3]] - mesh_vertices[atempt_triangles_1[:, 1]])
+-    align1 = (normals0 * normals1).sum(dim=1).abs()
+-    # select split
+-    mesh_triangles = torch.where((align0 > align1).unsqueeze(1), atempt_triangles_0, atempt_triangles_1).reshape(-1, 3)
++    tri_chunks = []
++    for s in range(0, L, chunk):
++        q, d = quad_indices[s:s + chunk], intersected_dir[s:s + chunk]
++        # if split 1
++        atempt_triangles_0 = torch.where(
++            (d == 1).unsqueeze(1),
++            q[:, remesh_narrow_band_dc.quad_split_1_p],
++            q[:, remesh_narrow_band_dc.quad_split_1_n]
++        )
++        normals0 = torch.cross(mesh_vertices[atempt_triangles_0[:, 1]] - mesh_vertices[atempt_triangles_0[:, 0]], mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 0]])
++        normals1 = torch.cross(mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 1]], mesh_vertices[atempt_triangles_0[:, 3]] - mesh_vertices[atempt_triangles_0[:, 1]])
++        align0 = (normals0 * normals1).sum(dim=1).abs()
++        # if split 2
++        atempt_triangles_1 = torch.where(
++            (d == 1).unsqueeze(1),
++            q[:, remesh_narrow_band_dc.quad_split_2_p],
++            q[:, remesh_narrow_band_dc.quad_split_2_n]
++        )
++        normals0 = torch.cross(mesh_vertices[atempt_triangles_1[:, 1]] - mesh_vertices[atempt_triangles_1[:, 0]], mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 0]])
++        normals1 = torch.cross(mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 1]], mesh_vertices[atempt_triangles_1[:, 3]] - mesh_vertices[atempt_triangles_1[:, 1]])
++        align1 = (normals0 * normals1).sum(dim=1).abs()
++        # select split
++        tri_chunks.append(torch.where((align0 > align1).unsqueeze(1), atempt_triangles_0, atempt_triangles_1).reshape(-1, 3))
++        del atempt_triangles_0, atempt_triangles_1, normals0, normals1, align0, align1
++    mesh_triangles = torch.cat(tri_chunks)
++    del tri_chunks
+         
+     # --------------------------------------------------------------------------
+     # 8. Optional: Project back to exact surface

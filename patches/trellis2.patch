@@ -1,0 +1,161 @@
+diff --git a/o-voxel/o_voxel/postprocess.py b/o-voxel/o_voxel/postprocess.py
+index 1ce8227..8d89ff6 100644
+--- a/o-voxel/o_voxel/postprocess.py
++++ b/o-voxel/o_voxel/postprocess.py
+@@ -97,6 +97,11 @@ def to_glb(
+     if verbose:
+         print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
+ 
++    # The attribute volume and its coordinates are only needed for baking, so they may arrive on the CPU and stay there
++    # through remeshing and simplification; the bounds and voxel size live on the GPU either way.
++    aabb = aabb.cuda()
++    voxel_size = voxel_size.cuda()
++
+     # Move data to GPU
+     vertices = vertices.cuda()
+     faces = faces.cuda()
+@@ -167,8 +172,9 @@ def to_glb(
+         scale = (aabb[1] - aabb[0]).max().item()
+         resolution = grid_size.max().item()
+         
+-        # Perform Dual Contouring remeshing (rebuilds topology)
+-        mesh.init(*cumesh.remeshing.remesh_narrow_band_dc(
++        # Perform Dual Contouring remeshing (rebuilds topology). The previous CuMesh is released before the remeshed one
++        # is built, rather than re-initialised in place, so its buffers are freed before the new ones are allocated.
++        remeshed = cumesh.remeshing.remesh_narrow_band_dc(
+             vertices, faces,
+             center = center,
+             scale = (resolution + 3 * remesh_band) / resolution * scale,
+@@ -177,9 +183,18 @@ def to_glb(
+             project_back = remesh_project, # Snaps vertices back to original surface
+             verbose = verbose,
+             bvh = bvh,
+-        ))
++        )
++        del mesh
++        torch.cuda.empty_cache()
++        mesh = cumesh.CuMesh()
++        mesh.init(*remeshed)
++        del remeshed
+         if verbose:
+             print(f"After remeshing: {mesh.num_vertices} vertices, {mesh.num_faces} faces")
++        torch.cuda.empty_cache()
++        if verbose:
++            free, total = torch.cuda.mem_get_info()
++            print(f"GPU before simplifying: {torch.cuda.memory_allocated() / 1e9:.2f} GB allocated by PyTorch, {free / 1e9:.2f} GB free of {total / 1e9:.2f} GB")
+         
+         # Simplify and clean the remeshed result (similar logic to above)
+         mesh.simplify(decimation_target, verbose=verbose)
+@@ -256,6 +271,8 @@ def to_glb(
+     valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
+     
+     # Trilinear sampling from the attribute volume (Color, Material props)
++    attr_volume = attr_volume.cuda()
++    coords = coords.cuda()
+     attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
+     attrs[mask] = grid_sample_3d(
+         attr_volume,
+diff --git a/trellis2/models/sc_vaes/sparse_unet_vae.py b/trellis2/models/sc_vaes/sparse_unet_vae.py
+index b9902a1..728184b 100644
+--- a/trellis2/models/sc_vaes/sparse_unet_vae.py
++++ b/trellis2/models/sc_vaes/sparse_unet_vae.py
+@@ -1,4 +1,5 @@
+ from typing import *
++import os
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -419,6 +420,10 @@ class SparseUnetVaeDecoder(nn.Module):
+         self.pred_subdiv = pred_subdiv
+         self.dtype = torch.float16 if use_fp16 else torch.float32
+         self.low_vram = False
++        # Spatial tiling of the last upsampling stages at inference, so high resolutions fit smaller GPUs: the edge, in
++        # voxels at the tiling stage, of each tile's core. Off (None) unless TRELLIS_DECODE_TILE is set.
++        self.tile = int(os.environ.get('TRELLIS_DECODE_TILE', 0)) or None
++        self.tile_margin = int(os.environ.get('TRELLIS_DECODE_TILE_MARGIN', 8))
+         
+         self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
+         self.from_latent = sp.SparseLinear(latent_channels, model_channels[0])
+@@ -478,7 +483,9 @@ class SparseUnetVaeDecoder(nn.Module):
+     def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
+         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
+         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
+-        
++        if self.tile and not self.training:
++            return self.forward_tiled(x, guide_subs=guide_subs, return_subs=return_subs)
++
+         h = self.from_latent(x)
+         h = h.type(self.dtype)
+         subs_gt = []
+@@ -506,6 +513,71 @@ class SparseUnetVaeDecoder(nn.Module):
+             else:
+                 return h
+     
++    def _run_stage(self, i: int, h: sp.SparseTensor, guide_sub=None, subs: list = None) -> sp.SparseTensor:
++        """Stage i's blocks, ending with its upsampling block (all stages but the last), as in forward."""
++        res = self.blocks[i]
++        for j, block in enumerate(res):
++            if i < len(self.blocks) - 1 and j == len(res) - 1:
++                if self.pred_subdiv:
++                    h, sub = block(h)
++                    subs.append(sub)
++                else:
++                    h = block(h, subdiv=guide_sub)
++            else:
++                h = block(h)
++        return h
++
++    def forward_tiled(self, x: sp.SparseTensor, guide_subs: Optional[list] = None, return_subs: bool = False, split: Optional[int] = None) -> sp.SparseTensor:
++        """
++        Inference forward that runs the stages before `split` on the whole tensor and the remaining stages (the high
++        resolution ones, where activations dominate memory) one spatial tile at a time. Every layer is a 3x3x3 sparse
++        convolution or per-voxel, so a tile whose margin covers the remaining layers' reach gives its core voxels the
++        same neighbourhoods as the whole-tensor pass; only the cores are kept. With return_subs, the subdivisions of
++        the tiled stages come back as one list per tile (in tile order), which a guided decoder consumes in the same
++        tile order, since its voxels at `split` match this decoder's.
++        """
++        n = len(self.blocks)
++        split = n - 2 if split is None else split
++        h = self.from_latent(x).type(self.dtype)
++        subs = []
++        for i in range(split):
++            h = self._run_stage(i, h, guide_subs[i] if guide_subs is not None else None, subs)
++        coords, xyz = h.coords, h.coords[:, 1:]
++        lo, hi = xyz.min(0).values.tolist(), xyz.max(0).values.tolist()
++        T, M, f = self.tile, self.tile_margin, 2 ** (n - 1 - split)
++        feats_out, coords_out, tile_subs, k = [], [], [], 0
++        for tx in range(lo[0], hi[0] + 1, T):
++            for ty in range(lo[1], hi[1] + 1, T):
++                for tz in range(lo[2], hi[2] + 1, T):
++                    core_lo = torch.tensor([tx, ty, tz], device=xyz.device, dtype=xyz.dtype)
++                    core_hi = core_lo + T
++                    if not ((xyz >= core_lo) & (xyz < core_hi)).all(1).any():
++                        continue
++                    idx = ((xyz >= core_lo - M) & (xyz < core_hi + M)).all(1).nonzero()[:, 0]
++                    t = sp.SparseTensor(h.feats[idx], coords[idx])
++                    t._scale = h._scale
++                    tsubs = []
++                    for i in range(split, n):
++                        # the last stage has no upsampling block, so no subdivision to guide
++                        guide = guide_subs[split][k][i - split] if guide_subs is not None and i < n - 1 else None
++                        t = self._run_stage(i, t, guide, tsubs)
++                    t = t.type(x.dtype)
++                    t = t.replace(F.layer_norm(t.feats, t.feats.shape[-1:]))
++                    t = self.output_layer(t)
++                    anc = torch.div(t.coords[:, 1:], f, rounding_mode='floor')
++                    keep = ((anc >= core_lo) & (anc < core_hi)).all(1)
++                    feats_out.append(t.feats[keep])
++                    coords_out.append(t.coords[keep])
++                    tile_subs.append(tsubs)
++                    k += 1
++                    del t
++                    torch.cuda.empty_cache()
++        out = sp.SparseTensor(torch.cat(feats_out), torch.cat(coords_out))
++        out._scale = tuple(s / 2 ** (n - 1) for s in x._scale)
++        if return_subs:
++            return out, subs + [tile_subs]
++        return out
++
+     def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
+         assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
+         
