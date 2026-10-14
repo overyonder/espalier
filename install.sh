@@ -41,15 +41,19 @@ fetch https://github.com/JeffreyXiang/nvdiffrec.git nvdiffrec "$NVDIFFREC_COMMIT
 [ -d "$venv" ] || uv venv --quiet --python 3.10 "$venv"
 uv pip install --python "$venv" torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 uv pip install --python "$venv" setuptools wheel ninja imageio imageio-ffmpeg tqdm easydict opencv-python-headless \
-    trimesh "transformers==4.57.1" pillow kornia timm zstandard \
+    trimesh plyfile "transformers==4.57.1" pillow kornia timm zstandard \
     "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"
 abi=$("$venv/bin/python" -c "import torch; print(str(torch._C._GLIBCXX_USE_CXX11_ABI).upper())")
 uv pip install --python "$venv" "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post2/flash_attn-2.8.3.post2%2Bcu12torch2.8cxx11abi${abi}-cp310-cp310-linux_x86_64.whl"
 
-# --no-cache --reinstall so the patched sources are always compiled, never a cached build of the originals
+# --no-cache --reinstall so the patched sources are always compiled, never a cached build of the originals, and
+# --no-deps because o-voxel lists CuMesh and FlexGEMM as unpinned git dependencies that would replace the builds above
 for ext in nvdiffrast:nvdiffrast nvdiffrec:nvdiffrec-render CuMesh:cumesh FlexGEMM:flex-gemm TRELLIS.2/o-voxel:o-voxel; do
     dir=${ext%%:*} package=${ext#*:}
     echo "building $dir"
-    uv pip install --python "$venv" --no-build-isolation --no-cache --reinstall-package "$package" "$src/$dir"
+    uv pip install --python "$venv" --no-build-isolation --no-cache --no-deps --reinstall-package "$package" "$src/$dir"
 done
+site=$("$venv/bin/python" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
+grep -q CUMESH_REMESH_CHUNK "$site/cumesh/remeshing.py" || { echo "the installed CuMesh is missing Espalier-2's patch"; exit 1; }
+grep -q "only needed for baking" "$site/o_voxel/postprocess.py" || { echo "the installed o-voxel is missing Espalier-2's patch"; exit 1; }
 echo "Espalier-2 is installed. Run: $here/espalier <image> <output directory>"
