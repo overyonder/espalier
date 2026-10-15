@@ -1,8 +1,157 @@
+diff --git a/o-voxel/o_voxel/convert/flexible_dual_grid.py b/o-voxel/o_voxel/convert/flexible_dual_grid.py
+index 7cf1397..5f9eb5e 100644
+--- a/o-voxel/o_voxel/convert/flexible_dual_grid.py
++++ b/o-voxel/o_voxel/convert/flexible_dual_grid.py
+@@ -1,4 +1,5 @@
+ from typing import *
++import os
+ import numpy as np
+ import torch
+ from .. import _C
+@@ -219,50 +220,68 @@ def flexible_dual_grid_to_mesh(
+ 
+     # Extract mesh
+     N = dual_vertices.shape[0]
+-    mesh_vertices = (coords.float() + dual_vertices) / (2 * N) - 0.5
+ 
+     # Store active voxels into hashmap
+     hashmap = _init_hashmap(grid_size, 2 * N, device=coords.device)
+     _C.hashmap_insert_3d_idx_as_val_cuda(*hashmap, torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1), *grid_size.tolist())
+ 
+-    # Find connected voxels
+-    edge_neighbor_voxel = coords.reshape(N, 1, 1, 3) + flexible_dual_grid_to_mesh.edge_neighbor_voxel_offset      # (N, 3, 4, 3)
+-    connected_voxel = edge_neighbor_voxel[intersected_flag]                           # (M, 4, 3)
+-    M = connected_voxel.shape[0]
+-    connected_voxel_hash_key = torch.cat([
+-        torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
+-        connected_voxel.reshape(-1, 3)
+-    ], dim=1)
+-    connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap, connected_voxel_hash_key, *grid_size.tolist()).reshape(M, 4).int()
+-    connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
+-    quad_indices = connected_voxel_indices[connected_voxel_valid].int()                             # (L, 4)
++    # Find connected voxels. Each voxel's quads depend only on that voxel, so this runs over chunks of voxels (the
++    # (N, 3, 4, 3) neighbour tensor is 144 bytes a voxel) and concatenates them in voxel order: the same quads in the
++    # same order as one pass. O_VOXEL_MESH_CHUNK sets the voxels per chunk, and the quads per chunk below.
++    chunk = int(os.environ.get('O_VOXEL_MESH_CHUNK', 4_000_000))
++    quad_chunks = [torch.empty((0, 4), dtype=torch.int, device=coords.device)]
++    for s in range(0, N, chunk):
++        edge_neighbor_voxel = coords[s:s + chunk].reshape(-1, 1, 1, 3) + flexible_dual_grid_to_mesh.edge_neighbor_voxel_offset      # (n, 3, 4, 3)
++        connected_voxel = edge_neighbor_voxel[intersected_flag[s:s + chunk]]              # (m, 4, 3)
++        M = connected_voxel.shape[0]
++        if M == 0:   # the lookup kernel can't launch on an empty grid
++            continue
++        connected_voxel_hash_key = torch.cat([
++            torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
++            connected_voxel.reshape(-1, 3)
++        ], dim=1)
++        connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap, connected_voxel_hash_key, *grid_size.tolist()).reshape(M, 4).int()
++        connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
++        quad_chunks.append(connected_voxel_indices[connected_voxel_valid].int())        # (l, 4)
++        del edge_neighbor_voxel, connected_voxel, connected_voxel_hash_key, connected_voxel_indices, connected_voxel_valid
++    del hashmap
++    quad_indices = torch.cat(quad_chunks)                                               # (L, 4)
++    del quad_chunks
+     L = quad_indices.shape[0]
+ 
+-    # Construct triangles
++    # Construct triangles. Each quad's split depends only on that quad, so inference runs over chunks of quads and
++    # concatenates them in quad order: the same triangles in the same order as one pass.
+     if not train:
+         mesh_vertices = (coords.float() + dual_vertices) * voxel_size + aabb[0].reshape(1, 3)
+-        if split_weight is None:
+-            # if split 1
+-            atempt_triangles_0 = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_1]
+-            normals0 = torch.cross(mesh_vertices[atempt_triangles_0[:, 1]] - mesh_vertices[atempt_triangles_0[:, 0]], mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 0]])
+-            normals1 = torch.cross(mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 1]], mesh_vertices[atempt_triangles_0[:, 3]] - mesh_vertices[atempt_triangles_0[:, 1]])
+-            align0 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
+-            # if split 2
+-            atempt_triangles_1 = quad_indices[:, flexible_dual_grid_to_mesh.quad_split_2]
+-            normals0 = torch.cross(mesh_vertices[atempt_triangles_1[:, 1]] - mesh_vertices[atempt_triangles_1[:, 0]], mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 0]])
+-            normals1 = torch.cross(mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 1]], mesh_vertices[atempt_triangles_1[:, 3]] - mesh_vertices[atempt_triangles_1[:, 1]])
+-            align1 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
+-            # select split
+-            mesh_triangles = torch.where(align0 > align1, atempt_triangles_0, atempt_triangles_1).reshape(-1, 3)
+-        else:
+-            split_weight_ws = split_weight[quad_indices]
+-            split_weight_ws_02 = split_weight_ws[:, 0] * split_weight_ws[:, 2]
+-            split_weight_ws_13 = split_weight_ws[:, 1] * split_weight_ws[:, 3]
+-            mesh_triangles = torch.where(
+-                split_weight_ws_02 > split_weight_ws_13,
+-                quad_indices[:, flexible_dual_grid_to_mesh.quad_split_1],
+-                quad_indices[:, flexible_dual_grid_to_mesh.quad_split_2]
+-            ).reshape(-1, 3)
++        tri_chunks = [quad_indices.new_empty((0, 3))]
++        for s in range(0, L, chunk):
++            q = quad_indices[s:s + chunk]
++            if split_weight is None:
++                # if split 1
++                atempt_triangles_0 = q[:, flexible_dual_grid_to_mesh.quad_split_1]
++                normals0 = torch.cross(mesh_vertices[atempt_triangles_0[:, 1]] - mesh_vertices[atempt_triangles_0[:, 0]], mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 0]])
++                normals1 = torch.cross(mesh_vertices[atempt_triangles_0[:, 2]] - mesh_vertices[atempt_triangles_0[:, 1]], mesh_vertices[atempt_triangles_0[:, 3]] - mesh_vertices[atempt_triangles_0[:, 1]])
++                align0 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
++                # if split 2
++                atempt_triangles_1 = q[:, flexible_dual_grid_to_mesh.quad_split_2]
++                normals0 = torch.cross(mesh_vertices[atempt_triangles_1[:, 1]] - mesh_vertices[atempt_triangles_1[:, 0]], mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 0]])
++                normals1 = torch.cross(mesh_vertices[atempt_triangles_1[:, 2]] - mesh_vertices[atempt_triangles_1[:, 1]], mesh_vertices[atempt_triangles_1[:, 3]] - mesh_vertices[atempt_triangles_1[:, 1]])
++                align1 = (normals0 * normals1).sum(dim=1, keepdim=True).abs()
++                # select split
++                tri_chunks.append(torch.where(align0 > align1, atempt_triangles_0, atempt_triangles_1).reshape(-1, 3))
++                del atempt_triangles_0, atempt_triangles_1, normals0, normals1, align0, align1
++            else:
++                split_weight_ws = split_weight[q]
++                split_weight_ws_02 = split_weight_ws[:, 0] * split_weight_ws[:, 2]
++                split_weight_ws_13 = split_weight_ws[:, 1] * split_weight_ws[:, 3]
++                tri_chunks.append(torch.where(
++                    split_weight_ws_02 > split_weight_ws_13,
++                    q[:, flexible_dual_grid_to_mesh.quad_split_1],
++                    q[:, flexible_dual_grid_to_mesh.quad_split_2]
++                ).reshape(-1, 3))
++                del split_weight_ws, split_weight_ws_02, split_weight_ws_13
++        mesh_triangles = torch.cat(tri_chunks)
++        del tri_chunks
+     else:
+         assert split_weight is not None, "split_weight must be provided in training mode"
+         mesh_vertices = (coords.float() + dual_vertices) * voxel_size + aabb[0].reshape(1, 3)
 diff --git a/o-voxel/o_voxel/postprocess.py b/o-voxel/o_voxel/postprocess.py
-index 1ce8227..8d89ff6 100644
+index 1ce8227..988649c 100644
 --- a/o-voxel/o_voxel/postprocess.py
 +++ b/o-voxel/o_voxel/postprocess.py
-@@ -97,6 +97,11 @@ def to_glb(
+@@ -31,6 +31,7 @@ def to_glb(
+     mesh_cluster_smooth_strength=1,
+     verbose: bool = False,
+     use_tqdm: bool = False,
++    bake: bool = True,
+ ):
+     """
+     Convert an extracted mesh to a GLB file.
+@@ -61,7 +62,7 @@ def to_glb(
+     if isinstance(aabb, (list, tuple)):
+         aabb = np.array(aabb)
+     if isinstance(aabb, np.ndarray):
+-        aabb = torch.tensor(aabb, dtype=torch.float32, device=coords.device)
++        aabb = torch.tensor(aabb, dtype=torch.float32, device=coords.device if coords is not None else None)
+     assert isinstance(aabb, torch.Tensor), f"aabb must be a list, tuple, np.ndarray, or torch.Tensor, but got {type(aabb)}"
+     assert aabb.dim() == 2, f"aabb must be a 2D tensor, but got {aabb.shape}"
+     assert aabb.size(0) == 2, f"aabb must have 2 rows, but got {aabb.size(0)}"
+@@ -74,7 +75,7 @@ def to_glb(
+         if isinstance(voxel_size, (list, tuple)):
+             voxel_size = np.array(voxel_size)
+         if isinstance(voxel_size, np.ndarray):
+-            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=coords.device)
++            voxel_size = torch.tensor(voxel_size, dtype=torch.float32, device=coords.device if coords is not None else None)
+         grid_size = ((aabb[1] - aabb[0]) / voxel_size).round().int()
+     else:
+         assert grid_size is not None, "Either voxel_size or grid_size must be provided"
+@@ -83,7 +84,7 @@ def to_glb(
+         if isinstance(grid_size, (list, tuple)):
+             grid_size = np.array(grid_size)
+         if isinstance(grid_size, np.ndarray):
+-            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=coords.device)
++            grid_size = torch.tensor(grid_size, dtype=torch.int32, device=coords.device if coords is not None else None)
+         voxel_size = (aabb[1] - aabb[0]) / grid_size
+     
+     # Assertions for dimensions
+@@ -97,6 +98,11 @@ def to_glb(
      if verbose:
          print(f"Original mesh: {vertices.shape[0]} vertices, {faces.shape[0]} faces")
  
@@ -14,26 +163,27 @@ index 1ce8227..8d89ff6 100644
      # Move data to GPU
      vertices = vertices.cuda()
      faces = faces.cuda()
-@@ -167,8 +172,9 @@ def to_glb(
+@@ -167,8 +173,11 @@ def to_glb(
          scale = (aabb[1] - aabb[0]).max().item()
          resolution = grid_size.max().item()
          
 -        # Perform Dual Contouring remeshing (rebuilds topology)
 -        mesh.init(*cumesh.remeshing.remesh_narrow_band_dc(
-+        # Perform Dual Contouring remeshing (rebuilds topology). The previous CuMesh is released before the remeshed one
-+        # is built, rather than re-initialised in place, so its buffers are freed before the new ones are allocated.
++        # Perform Dual Contouring remeshing (rebuilds topology). The remesh reads only the vertices, faces and BVH, so the
++        # previous CuMesh is released before it runs, and a new one is built for the result.
++        del mesh
++        torch.cuda.empty_cache()
 +        remeshed = cumesh.remeshing.remesh_narrow_band_dc(
              vertices, faces,
              center = center,
              scale = (resolution + 3 * remesh_band) / resolution * scale,
-@@ -177,9 +183,18 @@ def to_glb(
+@@ -177,9 +186,17 @@ def to_glb(
              project_back = remesh_project, # Snaps vertices back to original surface
              verbose = verbose,
              bvh = bvh,
 -        ))
 +        )
-+        del mesh
-+        torch.cuda.empty_cache()
++        torch.cuda.empty_cache()   # CuMesh allocates outside PyTorch, so it gets the remesh's cached blocks back first
 +        mesh = cumesh.CuMesh()
 +        mesh.init(*remeshed)
 +        del remeshed
@@ -46,7 +196,29 @@ index 1ce8227..8d89ff6 100644
          
          # Simplify and clean the remeshed result (similar logic to above)
          mesh.simplify(decimation_target, verbose=verbose)
-@@ -256,6 +271,8 @@ def to_glb(
+@@ -190,7 +207,20 @@ def to_glb(
+         pbar.update(1)
+     if verbose:
+         print("Done")
+-        
++
++    # Without baking, the result is the cleaned (or remeshed) and simplified surface with vertex normals, and no UVs
++    # or textures; attr_volume and coords may then be None.
++    if not bake:
++        out_vertices, out_faces = mesh.read()
++        mesh.compute_vertex_normals()
++        vertices_np = out_vertices.cpu().numpy()
++        faces_np = out_faces.cpu().numpy()
++        normals_np = mesh.read_vertex_normals().cpu().numpy()
++        vertices_np[:, 1], vertices_np[:, 2] = vertices_np[:, 2], -vertices_np[:, 1]
++        normals_np[:, 1], normals_np[:, 2] = normals_np[:, 2], -normals_np[:, 1]
++        if use_tqdm:
++            pbar.close()
++        return trimesh.Trimesh(vertices=vertices_np, faces=faces_np, vertex_normals=normals_np, process=False)
+     
+     # --- UV Parameterization ---
+     if use_tqdm:
+@@ -256,6 +286,8 @@ def to_glb(
      valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
      
      # Trilinear sampling from the attribute volume (Color, Material props)
@@ -55,8 +227,128 @@ index 1ce8227..8d89ff6 100644
      attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device='cuda')
      attrs[mask] = grid_sample_3d(
          attr_volume,
+diff --git a/trellis2/models/__init__.py b/trellis2/models/__init__.py
+index d4fed03..6329f8f 100644
+--- a/trellis2/models/__init__.py
++++ b/trellis2/models/__init__.py
+@@ -63,11 +63,100 @@ def from_pretrained(path: str, **kwargs):
+     with open(config_file, 'r') as f:
+         config = json.load(f)
+     model = __getattr__(config['name'])(**config['args'], **kwargs)
+-    model.load_state_dict(load_file(model_file), strict=False)
++    if os.environ.get('TRELLIS_STREAM_WEIGHTS', '1') != '0':
++        stream_weights_from_file(model, model_file)
++    else:
++        model.load_state_dict(load_file(model_file), strict=False)
+ 
+     return model
+ 
+ 
++# Weight streaming. In low-VRAM mode the pipeline moves each network to the GPU for its stage and back with .cpu(),
++# which keeps every network's weights in anonymous process memory: about 16 GB that the kernel can only swap. A streamed
++# network never copies its weights into process memory: they are read from the memory-mapped file straight to the GPU. `.cpu()` frees its weights and `.to(cuda)` reloads
++# them from the file. File reads go through the page cache, so recently used weights
++# stay in RAM while there is room and the kernel drops them for free under pressure, leaving the file as the last tier.
++# With TRELLIS_KEEP_IDLE_ON_GPU=1, `.cpu()` instead leaves the network resident, and before a network loads, idle
++# resident networks are freed, least recently used first, until the GPU has the network's size plus
++# TRELLIS_VRAM_HEADROOM_GIB (default 10) free for the stage's working memory. The weights are the file's, so
++# results are unchanged. TRELLIS_STREAM_WEIGHTS=0 restores the original behaviour.
++
++_idle_gpu_networks = []   # Streamed networks resident on the GPU but not in use, least recently used first
++
++
++def stream_weights_from_file(model, model_file: str) -> None:
++    import os
++    import types
++    import torch
++    from safetensors import safe_open
++    # The weights are never read into host memory: the parameters the constructor allocated are freed below, and the
++    # few persistent buffers the file stores (such as positional embeddings) are small, so they are read directly.
++    with safe_open(model_file, framework='pt') as weights:
++        in_file = set(weights.keys())
++        buffers = dict(model.named_buffers())
++        for name in in_file & set(buffers):
++            buffers[name].copy_(weights.get_tensor(name))
++    streamed = {name for name, _ in model.named_parameters() if name in in_file}
++    model._streamed_file = model_file
++    model._streamed_names = streamed
++    model._streamed_bytes = sum(p.numel() * p.element_size() for name, p in model.named_parameters() if name in streamed)
++    model._streamed_device = None   # The GPU holding the weights, or None when they are only in the file
++    _free_streamed_weights(model)
++    original_to = model.to
++
++    def to(self, *args, **kwargs):
++        device, _, _, _ = torch._C._nn._parse_to(*args, **kwargs)
++        if device is None:
++            return original_to(*args, **kwargs)
++        if device.type != 'cuda':
++            # Offloading: nothing is copied to the host. The weights are freed, leaving the small buffers on the GPU;
++            # with TRELLIS_KEEP_IDLE_ON_GPU=1 they stay resident until _make_room_on_gpu needs the room. That is only
++            # safe when every large allocation is a streamed network's load: a stage's own working memory, or a model
++            # loaded another way (an image encoder), doesn't trigger the freeing.
++            if self._streamed_device is not None and self not in _idle_gpu_networks:
++                if os.environ.get('TRELLIS_KEEP_IDLE_ON_GPU') == '1':
++                    _idle_gpu_networks.append(self)
++                else:
++                    # The freed blocks stay in PyTorch's cache for the next stage to reuse; returning them to the
++                    # driver here raised the texture decoder's peak by about 1 GiB at 1536.
++                    _free_streamed_weights(self)
++            return self
++        if self in _idle_gpu_networks:
++            _idle_gpu_networks.remove(self)
++        if self._streamed_device != device:
++            _make_room_on_gpu(device, self._streamed_bytes)
++            with safe_open(self._streamed_file, framework='pt', device=str(device)) as weights:
++                for name, parameter in self.named_parameters():
++                    if name in self._streamed_names:
++                        parameter.data = weights.get_tensor(name).to(parameter.dtype)
++            self._streamed_device = device
++        return original_to(*args, **kwargs)   # Moves the small unstreamed parameters and buffers
++
++    model.to = types.MethodType(to, model)
++    model.cpu = types.MethodType(lambda self: self.to('cpu'), model)
++    model.cuda = types.MethodType(lambda self, device=None: self.to(torch.device('cuda', device) if isinstance(device, int) else (device or 'cuda')), model)
++
++
++def _free_streamed_weights(model) -> None:
++    import torch
++    for name, parameter in model.named_parameters():
++        if name in model._streamed_names:
++            parameter.data = torch.empty(0, dtype=parameter.dtype)   # A placeholder; the weights live in the file
++    model._streamed_device = None
++
++
++def _make_room_on_gpu(device, network_bytes: int) -> None:
++    import os
++    import torch
++    headroom = float(os.environ.get('TRELLIS_VRAM_HEADROOM_GIB', 10)) * 2**30
++    while _idle_gpu_networks:
++        free, _ = torch.cuda.mem_get_info(device)
++        if free >= network_bytes + headroom:
++            return
++        _free_streamed_weights(_idle_gpu_networks.pop(0))
++        torch.cuda.empty_cache()
++
++
+ # For Pylance
+ if __name__ == '__main__':
+     from .sparse_structure_vae import SparseStructureEncoder, SparseStructureDecoder
+diff --git a/trellis2/models/sc_vaes/fdg_vae.py b/trellis2/models/sc_vaes/fdg_vae.py
+index 0209e69..e50419e 100644
+--- a/trellis2/models/sc_vaes/fdg_vae.py
++++ b/trellis2/models/sc_vaes/fdg_vae.py
+@@ -100,6 +100,9 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
+             vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
+             intersected = h.replace(h.feats[..., 3:6] > 0)
+             quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
++            # The decoded features are not needed past this point, so they are released before the mesh extraction.
++            del decoded, h
++            out_list[0] = None
+             mesh = [Mesh(*flexible_dual_grid_to_mesh(
+                 v.coords[:, 1:], v.feats, i.feats, q.feats,
+                 aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
 diff --git a/trellis2/models/sc_vaes/sparse_unet_vae.py b/trellis2/models/sc_vaes/sparse_unet_vae.py
-index b9902a1..728184b 100644
+index b9902a1..450aab4 100644
 --- a/trellis2/models/sc_vaes/sparse_unet_vae.py
 +++ b/trellis2/models/sc_vaes/sparse_unet_vae.py
 @@ -1,4 +1,5 @@
@@ -65,7 +357,23 @@ index b9902a1..728184b 100644
  import torch
  import torch.nn as nn
  import torch.nn.functional as F
-@@ -419,6 +420,10 @@ class SparseUnetVaeDecoder(nn.Module):
+@@ -284,7 +285,14 @@ class SparseConvNeXtBlock3d(nn.Module):
+     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
+         h = self.conv(x)
+         h = h.replace(self.norm(h.feats))
+-        h = h.replace(self.mlp(h.feats))
++        # The MLP is per voxel, so at inference it can run over chunks of voxels. Its hidden layer is mlp_ratio times
++        # wider than the block, the largest tensor of a decoder stage the tiling leaves whole. A chunk is a smaller
++        # matrix product, which cuBLAS may compute with different kernels, so results can differ in rounding.
++        chunk = int(os.environ.get('TRELLIS_DECODE_MLP_CHUNK', 0))
++        if chunk and not self.training and h.feats.shape[0] > chunk:
++            h = h.replace(torch.cat([self.mlp(part) for part in h.feats.split(chunk)]))
++        else:
++            h = h.replace(self.mlp(h.feats))
+         return h + x
+     
+     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
+@@ -419,6 +427,10 @@ class SparseUnetVaeDecoder(nn.Module):
          self.pred_subdiv = pred_subdiv
          self.dtype = torch.float16 if use_fp16 else torch.float32
          self.low_vram = False
@@ -76,7 +384,7 @@ index b9902a1..728184b 100644
          
          self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
          self.from_latent = sp.SparseLinear(latent_channels, model_channels[0])
-@@ -478,7 +483,9 @@ class SparseUnetVaeDecoder(nn.Module):
+@@ -478,7 +490,9 @@ class SparseUnetVaeDecoder(nn.Module):
      def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
          assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
          assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
@@ -87,7 +395,7 @@ index b9902a1..728184b 100644
          h = self.from_latent(x)
          h = h.type(self.dtype)
          subs_gt = []
-@@ -506,6 +513,71 @@ class SparseUnetVaeDecoder(nn.Module):
+@@ -506,6 +520,74 @@ class SparseUnetVaeDecoder(nn.Module):
              else:
                  return h
      
@@ -115,7 +423,10 @@ index b9902a1..728184b 100644
 +        tile order, since its voxels at `split` match this decoder's.
 +        """
 +        n = len(self.blocks)
-+        split = n - 2 if split is None else split
++        # TRELLIS_DECODE_TILE_SPLIT starts the tiles at an earlier stage when the stages before n - 2 don't fit whole.
++        # The tile edge and margin are then in voxels at that stage; the margin must cover the reach of every later
++        # convolution in that stage's voxels (from stage 2 of the 1536 decoders, about 12.25).
++        split = int(os.environ.get('TRELLIS_DECODE_TILE_SPLIT', n - 2)) if split is None else split
 +        h = self.from_latent(x).type(self.dtype)
 +        subs = []
 +        for i in range(split):
@@ -159,3 +470,86 @@ index b9902a1..728184b 100644
      def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
          assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
          
+diff --git a/trellis2/pipelines/trellis2_image_to_3d.py b/trellis2/pipelines/trellis2_image_to_3d.py
+index a7b84b9..fe3cdd2 100644
+--- a/trellis2/pipelines/trellis2_image_to_3d.py
++++ b/trellis2/pipelines/trellis2_image_to_3d.py
+@@ -468,7 +468,26 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+             resolution (int): The resolution of the output.
+         """
+         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
++        if tex_slat is None:   # shape only: the texture is sampled after the shape, so the meshes are unchanged
++            del subs
++            torch.cuda.empty_cache()
++            for m in meshes:
++                m.fill_holes()
++            return meshes
++        # The texture decoder reads only the subdivisions' voxels and values. Their spatial caches, the shape decoder's
++        # convolution neighbour maps, are rebuilt on demand, so they are cleared before the texture decoder runs. With
++        # tiling, the last entry of subs is a list of each tile's subdivisions.
++        def clear_spatial_caches(s):
++            if isinstance(s, (list, tuple)):
++                for t in s:
++                    clear_spatial_caches(t)
++            elif s is not None:
++                s.clear_spatial_cache()
++        clear_spatial_caches(subs)
+         tex_voxels = self.decode_tex_slat(tex_slat, subs)
++        # CuMesh allocates outside PyTorch, so hole filling gets the subdivisions and PyTorch's cached blocks back first.
++        del subs
++        torch.cuda.empty_cache()
+         out_mesh = []
+         for m, v in zip(meshes, tex_voxels):
+             m.fill_holes()
+@@ -498,6 +517,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+         return_latent: bool = False,
+         pipeline_type: Optional[str] = None,
+         max_num_tokens: int = 49152,
++        texture: bool = True,
+     ) -> List[MeshWithVoxel]:
+         """
+         Run the pipeline.
+@@ -513,6 +533,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+             return_latent (bool): Whether to return the latent codes.
+             pipeline_type (str): The type of the pipeline. Options: '512', '1024', '1024_cascade', '1536_cascade'.
+             max_num_tokens (int): The maximum number of tokens to use.
++            texture (bool): Whether to sample and decode the texture; without it the result is the shape's meshes.
+         """
+         # Check pipeline type
+         pipeline_type = pipeline_type or self.default_pipeline_type
+@@ -548,7 +569,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+                 cond_512, self.models['shape_slat_flow_model_512'],
+                 coords, shape_slat_sampler_params
+             )
+-            tex_slat = self.sample_tex_slat(
++            tex_slat = None if not texture else self.sample_tex_slat(
+                 cond_512, self.models['tex_slat_flow_model_512'],
+                 shape_slat, tex_slat_sampler_params
+             )
+@@ -558,7 +579,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+                 cond_1024, self.models['shape_slat_flow_model_1024'],
+                 coords, shape_slat_sampler_params
+             )
+-            tex_slat = self.sample_tex_slat(
++            tex_slat = None if not texture else self.sample_tex_slat(
+                 cond_1024, self.models['tex_slat_flow_model_1024'],
+                 shape_slat, tex_slat_sampler_params
+             )
+@@ -571,7 +592,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+                 coords, shape_slat_sampler_params,
+                 max_num_tokens
+             )
+-            tex_slat = self.sample_tex_slat(
++            tex_slat = None if not texture else self.sample_tex_slat(
+                 cond_1024, self.models['tex_slat_flow_model_1024'],
+                 shape_slat, tex_slat_sampler_params
+             )
+@@ -583,7 +604,7 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+                 coords, shape_slat_sampler_params,
+                 max_num_tokens
+             )
+-            tex_slat = self.sample_tex_slat(
++            tex_slat = None if not texture else self.sample_tex_slat(
+                 cond_1024, self.models['tex_slat_flow_model_1024'],
+                 shape_slat, tex_slat_sampler_params
+             )

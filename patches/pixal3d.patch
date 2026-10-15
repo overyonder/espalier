@@ -1,0 +1,479 @@
+diff --git a/pixal3d/models/__init__.py b/pixal3d/models/__init__.py
+index d4fed03..cd6f1d1 100644
+--- a/pixal3d/models/__init__.py
++++ b/pixal3d/models/__init__.py
+@@ -64,10 +64,93 @@ def from_pretrained(path: str, **kwargs):
+         config = json.load(f)
+     model = __getattr__(config['name'])(**config['args'], **kwargs)
+     model.load_state_dict(load_file(model_file), strict=False)
++    if os.environ.get('TRELLIS_STREAM_WEIGHTS', '1') != '0':
++        stream_weights_from_file(model, model_file)
+ 
+     return model
+ 
+ 
++# Weight streaming. In low-VRAM mode the pipeline moves each network to the GPU for its stage and back with .cpu(),
++# which keeps every network's weights in anonymous process memory: about 16 GB that the kernel can only swap. A streamed
++# network keeps no host copy of the weights it loaded from its file. `.cpu()` frees its weights and `.to(cuda)` reloads
++# them from the file. File reads go through the page cache, so recently used weights
++# stay in RAM while there is room and the kernel drops them for free under pressure, leaving the file as the last tier.
++# With TRELLIS_KEEP_IDLE_ON_GPU=1, `.cpu()` instead leaves the network resident, and before a network loads, idle
++# resident networks are freed, least recently used first, until the GPU has the network's size plus
++# TRELLIS_VRAM_HEADROOM_GIB (default 10) free for the stage's working memory. The weights are the file's, so
++# results are unchanged. TRELLIS_STREAM_WEIGHTS=0 restores the original behaviour.
++
++_idle_gpu_networks = []   # Streamed networks resident on the GPU but not in use, least recently used first
++
++
++def stream_weights_from_file(model, model_file: str) -> None:
++    import os
++    import types
++    import torch
++    from safetensors import safe_open
++    with safe_open(model_file, framework='pt') as weights:
++        in_file = set(weights.keys())
++    streamed = {name for name, _ in model.named_parameters() if name in in_file}
++    model._streamed_file = model_file
++    model._streamed_names = streamed
++    model._streamed_bytes = sum(p.numel() * p.element_size() for name, p in model.named_parameters() if name in streamed)
++    model._streamed_device = None   # The GPU holding the weights, or None when they are only in the file
++    _free_streamed_weights(model)
++    original_to = model.to
++
++    def to(self, *args, **kwargs):
++        device, _, _, _ = torch._C._nn._parse_to(*args, **kwargs)
++        if device is None:
++            return original_to(*args, **kwargs)
++        if device.type != 'cuda':
++            # Offloading: nothing is copied to the host. The weights are freed, leaving the small buffers on the GPU;
++            # with TRELLIS_KEEP_IDLE_ON_GPU=1 they stay resident until _make_room_on_gpu needs the room. That is only
++            # safe when every large allocation is a streamed network's load: a stage's own working memory, or a model
++            # loaded another way (an image encoder), doesn't trigger the freeing.
++            if self._streamed_device is not None and self not in _idle_gpu_networks:
++                if os.environ.get('TRELLIS_KEEP_IDLE_ON_GPU') == '1':
++                    _idle_gpu_networks.append(self)
++                else:
++                    # The freed blocks stay in PyTorch's cache for the next stage to reuse; returning them to the
++                    # driver here raised the texture decoder's peak by about 1 GiB at 1536.
++                    _free_streamed_weights(self)
++            return self
++        if self in _idle_gpu_networks:
++            _idle_gpu_networks.remove(self)
++        if self._streamed_device != device:
++            _make_room_on_gpu(device, self._streamed_bytes)
++            with safe_open(self._streamed_file, framework='pt', device=str(device)) as weights:
++                for name, parameter in self.named_parameters():
++                    if name in self._streamed_names:
++                        parameter.data = weights.get_tensor(name).to(parameter.dtype)
++            self._streamed_device = device
++        return original_to(*args, **kwargs)   # Moves the small unstreamed parameters and buffers
++
++    model.to = types.MethodType(to, model)
++    model.cpu = types.MethodType(lambda self: self.to('cpu'), model)
++    model.cuda = types.MethodType(lambda self, device=None: self.to(torch.device('cuda', device) if isinstance(device, int) else (device or 'cuda')), model)
++
++
++def _free_streamed_weights(model) -> None:
++    import torch
++    for name, parameter in model.named_parameters():
++        if name in model._streamed_names:
++            parameter.data = torch.empty(0, dtype=parameter.dtype)   # A placeholder; the weights live in the file
++    model._streamed_device = None
++
++
++def _make_room_on_gpu(device, network_bytes: int) -> None:
++    import os
++    import torch
++    headroom = float(os.environ.get('TRELLIS_VRAM_HEADROOM_GIB', 10)) * 2**30
++    while _idle_gpu_networks:
++        free, _ = torch.cuda.mem_get_info(device)
++        if free >= network_bytes + headroom:
++            return
++        _free_streamed_weights(_idle_gpu_networks.pop(0))
++        torch.cuda.empty_cache()
++
++
+ # For Pylance
+ if __name__ == '__main__':
+     from .sparse_structure_vae import SparseStructureEncoder, SparseStructureDecoder
+diff --git a/pixal3d/models/sc_vaes/fdg_vae.py b/pixal3d/models/sc_vaes/fdg_vae.py
+index 0209e69..e50419e 100644
+--- a/pixal3d/models/sc_vaes/fdg_vae.py
++++ b/pixal3d/models/sc_vaes/fdg_vae.py
+@@ -100,6 +100,9 @@ class FlexiDualGridVaeDecoder(SparseUnetVaeDecoder):
+             vertices = h.replace((1 + 2 * self.voxel_margin) * F.sigmoid(h.feats[..., 0:3]) - self.voxel_margin)
+             intersected = h.replace(h.feats[..., 3:6] > 0)
+             quad_lerp = h.replace(F.softplus(h.feats[..., 6:7]))
++            # The decoded features are not needed past this point, so they are released before the mesh extraction.
++            del decoded, h
++            out_list[0] = None
+             mesh = [Mesh(*flexible_dual_grid_to_mesh(
+                 v.coords[:, 1:], v.feats, i.feats, q.feats,
+                 aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
+diff --git a/pixal3d/models/sc_vaes/sparse_unet_vae.py b/pixal3d/models/sc_vaes/sparse_unet_vae.py
+index b9902a1..db8f5b9 100644
+--- a/pixal3d/models/sc_vaes/sparse_unet_vae.py
++++ b/pixal3d/models/sc_vaes/sparse_unet_vae.py
+@@ -1,4 +1,5 @@
+ from typing import *
++import os
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -284,7 +285,14 @@ class SparseConvNeXtBlock3d(nn.Module):
+     def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
+         h = self.conv(x)
+         h = h.replace(self.norm(h.feats))
+-        h = h.replace(self.mlp(h.feats))
++        # The MLP is per voxel, so at inference it can run over chunks of voxels. Its hidden layer is mlp_ratio times
++        # wider than the block, the largest tensor of a decoder stage the tiling leaves whole. Smaller row counts can make
++        # cuBLAS pick different GEMM kernels, so the result differs in floating-point rounding, as tiling's does.
++        chunk = int(os.environ.get('TRELLIS_DECODE_MLP_CHUNK', 0))
++        if chunk and not self.training and h.feats.shape[0] > chunk:
++            h = h.replace(torch.cat([self.mlp(part) for part in h.feats.split(chunk)]))
++        else:
++            h = h.replace(self.mlp(h.feats))
+         return h + x
+     
+     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
+@@ -419,6 +427,10 @@ class SparseUnetVaeDecoder(nn.Module):
+         self.pred_subdiv = pred_subdiv
+         self.dtype = torch.float16 if use_fp16 else torch.float32
+         self.low_vram = False
++        # Spatial tiling of the last upsampling stages at inference, so high resolutions fit smaller GPUs: the edge, in
++        # voxels at the tiling stage, of each tile's core. Off (None) unless TRELLIS_DECODE_TILE is set.
++        self.tile = int(os.environ.get('TRELLIS_DECODE_TILE', 0)) or None
++        self.tile_margin = int(os.environ.get('TRELLIS_DECODE_TILE_MARGIN', 8))
+         
+         self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
+         self.from_latent = sp.SparseLinear(latent_channels, model_channels[0])
+@@ -478,7 +490,9 @@ class SparseUnetVaeDecoder(nn.Module):
+     def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
+         assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
+         assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
+-        
++        if self.tile and not self.training:
++            return self.forward_tiled(x, guide_subs=guide_subs, return_subs=return_subs)
++
+         h = self.from_latent(x)
+         h = h.type(self.dtype)
+         subs_gt = []
+@@ -506,6 +520,74 @@ class SparseUnetVaeDecoder(nn.Module):
+             else:
+                 return h
+     
++    def _run_stage(self, i: int, h: sp.SparseTensor, guide_sub=None, subs: list = None) -> sp.SparseTensor:
++        """Stage i's blocks, ending with its upsampling block (all stages but the last), as in forward."""
++        res = self.blocks[i]
++        for j, block in enumerate(res):
++            if i < len(self.blocks) - 1 and j == len(res) - 1:
++                if self.pred_subdiv:
++                    h, sub = block(h)
++                    subs.append(sub)
++                else:
++                    h = block(h, subdiv=guide_sub)
++            else:
++                h = block(h)
++        return h
++
++    def forward_tiled(self, x: sp.SparseTensor, guide_subs: Optional[list] = None, return_subs: bool = False, split: Optional[int] = None) -> sp.SparseTensor:
++        """
++        Inference forward that runs the stages before `split` on the whole tensor and the remaining stages (the high
++        resolution ones, where activations dominate memory) one spatial tile at a time. Every layer is a 3x3x3 sparse
++        convolution or per-voxel, so a tile whose margin covers the remaining layers' reach gives its core voxels the
++        same neighbourhoods as the whole-tensor pass; only the cores are kept. With return_subs, the subdivisions of
++        the tiled stages come back as one list per tile (in tile order), which a guided decoder consumes in the same
++        tile order, since its voxels at `split` match this decoder's.
++        """
++        n = len(self.blocks)
++        # TRELLIS_DECODE_TILE_SPLIT starts the tiles at an earlier stage when the stages before n - 2 don't fit whole.
++        # The tile edge and margin are then in voxels at that stage; the margin must cover the reach of every later
++        # convolution in that stage's voxels (from stage 2 of the 1536 decoders, about 12.25).
++        split = int(os.environ.get('TRELLIS_DECODE_TILE_SPLIT', n - 2)) if split is None else split
++        h = self.from_latent(x).type(self.dtype)
++        subs = []
++        for i in range(split):
++            h = self._run_stage(i, h, guide_subs[i] if guide_subs is not None else None, subs)
++        coords, xyz = h.coords, h.coords[:, 1:]
++        lo, hi = xyz.min(0).values.tolist(), xyz.max(0).values.tolist()
++        T, M, f = self.tile, self.tile_margin, 2 ** (n - 1 - split)
++        feats_out, coords_out, tile_subs, k = [], [], [], 0
++        for tx in range(lo[0], hi[0] + 1, T):
++            for ty in range(lo[1], hi[1] + 1, T):
++                for tz in range(lo[2], hi[2] + 1, T):
++                    core_lo = torch.tensor([tx, ty, tz], device=xyz.device, dtype=xyz.dtype)
++                    core_hi = core_lo + T
++                    if not ((xyz >= core_lo) & (xyz < core_hi)).all(1).any():
++                        continue
++                    idx = ((xyz >= core_lo - M) & (xyz < core_hi + M)).all(1).nonzero()[:, 0]
++                    t = sp.SparseTensor(h.feats[idx], coords[idx])
++                    t._scale = h._scale
++                    tsubs = []
++                    for i in range(split, n):
++                        # the last stage has no upsampling block, so no subdivision to guide
++                        guide = guide_subs[split][k][i - split] if guide_subs is not None and i < n - 1 else None
++                        t = self._run_stage(i, t, guide, tsubs)
++                    t = t.type(x.dtype)
++                    t = t.replace(F.layer_norm(t.feats, t.feats.shape[-1:]))
++                    t = self.output_layer(t)
++                    anc = torch.div(t.coords[:, 1:], f, rounding_mode='floor')
++                    keep = ((anc >= core_lo) & (anc < core_hi)).all(1)
++                    feats_out.append(t.feats[keep])
++                    coords_out.append(t.coords[keep])
++                    tile_subs.append(tsubs)
++                    k += 1
++                    del t
++                    torch.cuda.empty_cache()
++        out = sp.SparseTensor(torch.cat(feats_out), torch.cat(coords_out))
++        out._scale = tuple(s / 2 ** (n - 1) for s in x._scale)
++        if return_subs:
++            return out, subs + [tile_subs]
++        return out
++
+     def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
+         assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
+         
+diff --git a/pixal3d/pipelines/pixal3d_image_to_3d.py b/pixal3d/pipelines/pixal3d_image_to_3d.py
+index 7129482..ac8768c 100644
+--- a/pixal3d/pipelines/pixal3d_image_to_3d.py
++++ b/pixal3d/pipelines/pixal3d_image_to_3d.py
+@@ -268,16 +268,18 @@ class Pixal3DImageTo3DPipeline(Pipeline):
+         cam_angle = torch.tensor([camera_angle_x], device=device)
+         dist_tensor = torch.tensor([distance], device=device)
+         scale_tensor = torch.tensor([mesh_scale], device=device)
+-        z_global, z_proj = image_cond_model(
+-            image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
+-        )
++        # Project only the occupied cells: the dense grid at 1536 (96³ cells x 2048 channels) is 6.75 GiB.
+         grid_res = image_cond_model.grid_resolution
+-        z_proj_grid = z_proj.reshape(B, grid_res, grid_res, grid_res, -1)
+         batch_indices = coords[:, 0].long()
+         x_coords = coords[:, 1].long()
+         y_coords = coords[:, 2].long()
+         z_coords = coords[:, 3].long()
+-        z_proj_sparse = z_proj_grid[batch_indices, x_coords, y_coords, z_coords]
++        image_cond_model.proj_grid.sample_index = (x_coords * grid_res + y_coords) * grid_res + z_coords
++        z_global, z_proj = image_cond_model(
++            image, camera_angle_x=cam_angle, distance=dist_tensor, mesh_scale=scale_tensor,
++        )
++        image_cond_model.proj_grid.sample_index = None
++        z_proj_sparse = z_proj[batch_indices, torch.arange(coords.shape[0], device=coords.device)]
+         z_proj_st = SparseTensor(feats=z_proj_sparse, coords=coords)
+ 
+         if grid_resolution_override is not None and grid_resolution_override != orig_grid_res:
+@@ -587,7 +589,26 @@ class Pixal3DImageTo3DPipeline(Pipeline):
+             resolution (int): The resolution of the output.
+         """
+         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
++        if tex_slat is None:   # shape only
++            del subs
++            torch.cuda.empty_cache()
++            for m in meshes:
++                m.fill_holes()
++            return meshes
++        # The subdivision guides carry the shape decoder's spatial caches (3.4 GiB on a dense shape at 1536). The texture
++        # decoder only needs their coordinates and features, and caches are rebuilt on demand, so they are cleared first.
++        def clear_spatial_caches(value):
++            if isinstance(value, SparseTensor):
++                value.clear_spatial_cache()
++            elif isinstance(value, (list, tuple)):
++                for item in value:
++                    clear_spatial_caches(item)
++        clear_spatial_caches(subs)
++        torch.cuda.empty_cache()
+         tex_voxels = self.decode_tex_slat(tex_slat, subs)
++        # CuMesh allocates outside PyTorch, so hole filling gets the subdivisions and PyTorch's cached blocks back first.
++        del subs
++        torch.cuda.empty_cache()
+         out_mesh = []
+         torch.cuda.synchronize()
+         for m, v in zip(meshes, tex_voxels):
+@@ -619,9 +640,11 @@ class Pixal3DImageTo3DPipeline(Pipeline):
+         return_latent: bool = False,
+         pipeline_type: Optional[str] = None,
+         max_num_tokens: int = 49152,
++        texture: bool = True,
+     ) -> List[MeshWithVoxel]:
+         """
+-        Run the Pixal3D pipeline (proj mode, cascade).
++        Run the Pixal3D pipeline (proj mode, cascade). With texture=False the texture is neither sampled nor decoded,
++        and the result is the shape's meshes; the texture is sampled after the shape, so the meshes are unchanged.
+ 
+         Args:
+             image (Image.Image): The image prompt.
+@@ -759,20 +782,22 @@ class Pixal3DImageTo3DPipeline(Pipeline):
+         torch.cuda.empty_cache()
+ 
+         # ---- Stage 4: Texture (proj) ----
+-        tex_grid_res = actual_hr_resolution // 16
+-        cond_tex = self.get_proj_cond_shape(
+-            self.image_cond_model_tex_1024, [image], shape_slat.coords,
+-            camera_angle_x=camera_angle_x,
+-            distance=distance,
+-            mesh_scale=mesh_scale,
+-            grid_resolution_override=tex_grid_res,
+-        )
+-        tex_slat = self.sample_tex_slat(
+-            cond_tex, self.models['tex_slat_flow_model_1024'],
+-            shape_slat, tex_slat_sampler_params
+-        )
+-        del cond_tex
+-        torch.cuda.empty_cache()
++        tex_slat = None
++        if texture:
++            tex_grid_res = actual_hr_resolution // 16
++            cond_tex = self.get_proj_cond_shape(
++                self.image_cond_model_tex_1024, [image], shape_slat.coords,
++                camera_angle_x=camera_angle_x,
++                distance=distance,
++                mesh_scale=mesh_scale,
++                grid_resolution_override=tex_grid_res,
++            )
++            tex_slat = self.sample_tex_slat(
++                cond_tex, self.models['tex_slat_flow_model_1024'],
++                shape_slat, tex_slat_sampler_params
++            )
++            del cond_tex
++            torch.cuda.empty_cache()
+ 
+         # ---- Stage 5: Decode ----
+         res = actual_hr_resolution
+diff --git a/pixal3d/pipelines/pixal3d_mv_image_to_3d.py b/pixal3d/pipelines/pixal3d_mv_image_to_3d.py
+index 84bcf97..1b99e39 100644
+--- a/pixal3d/pipelines/pixal3d_mv_image_to_3d.py
++++ b/pixal3d/pipelines/pixal3d_mv_image_to_3d.py
+@@ -118,17 +118,17 @@ class Pixal3DMVImageTo3DPipeline(Pixal3DImageTo3DPipeline):
+                 image_resolution=image_cond_model.proj_grid.image_resolution,
+             ).to(device)
+ 
+-        z_global, z_proj = self._run_extractor(
+-            image_cond_model, views, camera_angle_x, distance, mesh_scale)
+-
+-        B = z_global.shape[0]
++        # Project only the occupied cells: the dense grid at 1536 (96³ cells x 2048 channels) is 6.75 GiB per view.
+         grid_res = image_cond_model.grid_resolution
+         b_idx = coords[:, 0].long()
+         x_idx = coords[:, 1].long()
+         y_idx = coords[:, 2].long()
+         z_idx = coords[:, 3].long()
+-        z_proj_grid = z_proj.reshape(B, grid_res, grid_res, grid_res, -1)
+-        z_proj_sparse = z_proj_grid[b_idx, x_idx, y_idx, z_idx]
++        image_cond_model.proj_grid.sample_index = (x_idx * grid_res + y_idx) * grid_res + z_idx
++        z_global, z_proj = self._run_extractor(
++            image_cond_model, views, camera_angle_x, distance, mesh_scale)
++        image_cond_model.proj_grid.sample_index = None
++        z_proj_sparse = z_proj[b_idx, torch.arange(coords.shape[0], device=coords.device)]
+         z_proj_st = SparseTensor(feats=z_proj_sparse, coords=coords)
+ 
+         if override:
+diff --git a/pixal3d/pipelines/trellis2_image_to_3d.py b/pixal3d/pipelines/trellis2_image_to_3d.py
+index e4bffc2..5819b65 100644
+--- a/pixal3d/pipelines/trellis2_image_to_3d.py
++++ b/pixal3d/pipelines/trellis2_image_to_3d.py
+@@ -479,7 +479,20 @@ class Trellis2ImageTo3DPipeline(Pipeline):
+             resolution (int): The resolution of the output.
+         """
+         meshes, subs = self.decode_shape_slat(shape_slat, resolution)
++        # The subdivision guides carry the shape decoder's spatial caches (3.4 GiB on a dense shape at 1536). The texture
++        # decoder only needs their coordinates and features, and caches are rebuilt on demand, so they are cleared first.
++        def clear_spatial_caches(value):
++            if isinstance(value, SparseTensor):
++                value.clear_spatial_cache()
++            elif isinstance(value, (list, tuple)):
++                for item in value:
++                    clear_spatial_caches(item)
++        clear_spatial_caches(subs)
++        torch.cuda.empty_cache()
+         tex_voxels = self.decode_tex_slat(tex_slat, subs)
++        # CuMesh allocates outside PyTorch, so hole filling gets the subdivisions and PyTorch's cached blocks back first.
++        del subs
++        torch.cuda.empty_cache()
+         out_mesh = []
+         torch.cuda.synchronize()
+         for m, v in zip(meshes, tex_voxels):
+diff --git a/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py b/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py
+index 0f721e0..a3028eb 100644
+--- a/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py
++++ b/pixal3d/trainers/flow_matching/mixins/image_conditioned_proj.py
+@@ -139,6 +139,44 @@ def sample_features(fmap: torch.Tensor, queries_ndc: torch.Tensor) -> torch.Tens
+ # Projection Grid Module
+ # =============================================================================
+ 
++
++def tile_naf_attention(naf_model: nn.Module, tile: int) -> None:
++    """
++    Run NAF's cross-attention in square tiles of `tile` query pixels instead of over the whole output at once.
++
++    NAF enlarges the low-resolution keys and values to the query size by nearest-neighbour copying, then attends
++    over a kernel x kernel neighbourhood at dilation (query size / key size). At a 1024 output with 1024 channels that
++    enlarged value tensor alone is 4 GiB. A query pixel only sees pixels within (kernel // 2) * dilation of itself, so
++    each tile carries that margin, enlarges just its slice of the keys and values, and keeps only its core. Tile edges
++    and margins are multiples of the dilation, so every core pixel attends over exactly the pixels it would in the
++    untiled pass and its neighbourhood is never shifted by a tile edge.
++    """
++    from einops import rearrange
++    attn = naf_model.model.upsampler if hasattr(naf_model, 'model') else naf_model.upsampler
++    untiled = attn.forward
++
++    def forward(q, k, v, image=None, return_weights=False, **kwargs):
++        hq, wq = q.shape[-2:]
++        hk, wk = k.shape[-2:]
++        dy, dx = hq // hk, wq // wk
++        if return_weights or (hq <= tile and wq <= tile) or hq % hk or wq % wk or tile % dy or tile % dx:
++            return untiled(q, k, v, image=image, return_weights=return_weights, **kwargs)
++        my, mx = (attn.kernel_size[0] // 2) * dy, (attn.kernel_size[1] // 2) * dx
++        out = None
++        for y0 in range(0, hq, tile):
++            for x0 in range(0, wq, tile):
++                y1, x1 = min(y0 + tile, hq), min(x0 + tile, wq)
++                ty0, tx0 = max(0, y0 - my), max(0, x0 - mx)
++                ty1, tx1 = min(hq, y1 + my), min(wq, x1 + mx)
++                part = untiled(q[..., ty0:ty1, tx0:tx1], k[..., ty0 // dy:ty1 // dy, tx0 // dx:tx1 // dx],
++                               v[..., ty0 // dy:ty1 // dy, tx0 // dx:tx1 // dx], image=image)
++                if out is None:
++                    out = part.new_empty(part.shape[0], part.shape[1], hq, wq)
++                out[..., y0:y1, x0:x1] = part[..., y0 - ty0:y1 - ty0, x0 - tx0:x1 - tx0]
++        return out
++
++    attn.forward = forward
++
+ class ProjGrid(nn.Module):
+     """
+     3D Grid Projection Module.
+@@ -176,6 +214,9 @@ class ProjGrid(nn.Module):
+             [0.0, 0.0, 0.0, 1.0]
+         ])
+         self.register_buffer("front_view_transform_matrix", front_view_transform_matrix)
++        # Flat indices into grid_points (x * R² + y * R + z) to project only those cells, or None for the whole grid.
++        # Each cell is projected and sampled independently, so a subset gives exactly the dense result's rows.
++        self.sample_index = None
+         
+     def forward(
+         self, 
+@@ -205,7 +246,7 @@ class ProjGrid(nn.Module):
+         else:
+             B, C, H, W = features_map.shape
+             
+-        grid_points = self.grid_points
++        grid_points = self.grid_points if self.sample_index is None else self.grid_points[self.sample_index]
+         grid_points = grid_points.expand(B, -1, -1)
+         grid_points = grid_points / mesh_scale.unsqueeze(-1).unsqueeze(-1) / 2  # Scale alignment
+         assert transform_matrix is None, "transform_matrix is not None"
+@@ -365,7 +406,7 @@ class ProjGridMV(ProjGrid):
+         else:
+             B, C, H, W = features_map.shape
+ 
+-        grid_points = self.grid_points
++        grid_points = self.grid_points if self.sample_index is None else self.grid_points[self.sample_index]
+         grid_points = grid_points.expand(B, -1, -1)
+         grid_points = grid_points / mesh_scale.unsqueeze(-1).unsqueeze(-1) / 2  # Scale alignment
+ 
+@@ -518,6 +559,8 @@ class DinoV3ProjFeatureExtractor(nn.Module):
+             )
+             self.naf_model.eval()
+             self.naf_model.requires_grad_(False)
++            if int(os.environ.get('NAF_TILE', 0)):
++                tile_naf_attention(self.naf_model, int(os.environ['NAF_TILE']))
+         
+     def to(self, device):
+         super().to(device)

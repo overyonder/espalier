@@ -1,5 +1,5 @@
 diff --git a/cumesh/remeshing.py b/cumesh/remeshing.py
-index 272a6c1..f564a8e 100644
+index 272a6c1..c9934fe 100644
 --- a/cumesh/remeshing.py
 +++ b/cumesh/remeshing.py
 @@ -1,4 +1,5 @@
@@ -8,7 +8,24 @@ index 272a6c1..f564a8e 100644
  import torch
  from tqdm import tqdm
  from . import _C
-@@ -187,19 +188,29 @@ def remesh_narrow_band_dc(
+@@ -139,6 +140,8 @@ def remesh_narrow_band_dc(
+         coords = coords.unsqueeze(1) + OFFSETS.unsqueeze(0) # (N, 8, 3)
+         coords = coords.reshape(-1, 3)
+         pbar.update(1)
++    # The last refinement pass's points and distances are not used past this point.
++    del pts, distances, subdiv_mask
+ 
+     # -------------------------------------------------------------------------
+     # 4. Prepare Data for Dual Contouring
+@@ -161,6 +164,7 @@ def remesh_narrow_band_dc(
+     # Note: We shift the surface by `eps` so the isosurface is at 0.
+     pts_vert = (grid_verts.float() / resolution - 0.5) * scale + center
+     distances_vert = bvh.unsigned_distance(pts_vert)[0]
++    del pts_vert
+     distances_vert -= eps 
+     # distances_vert is now "Signed" Distance where < 0 is inside the band, > 0 is outside.
+     
+@@ -187,50 +191,77 @@ def remesh_narrow_band_dc(
      # -------------------------------------------------------------------------
      # 6. Topology Generation (Connectivity)
      # -------------------------------------------------------------------------
@@ -28,7 +45,7 @@ index 272a6c1..f564a8e 100644
 +    # Find connected voxels. Each voxel's quads depend only on that voxel, so this runs over chunks of voxels (the
 +    # (N, 3, 4, 3) neighbour tensor is 144 bytes a voxel) and concatenates them in voxel order: the same quads in the
 +    # same order as one pass. CUMESH_REMESH_CHUNK sets the voxels per chunk.
-+    chunk = int(os.environ.get('CUMESH_REMESH_CHUNK', 4_000_000))
++    chunk = int(os.environ.get('CUMESH_REMESH_CHUNK', 2_000_000))
 +    quad_chunks, dir_chunks = [], []
 +    for s in range(0, Nvox, chunk):
 +        c_coords, c_intersected = coords[s:s + chunk], intersected[s:s + chunk]
@@ -51,9 +68,20 @@ index 272a6c1..f564a8e 100644
      L = quad_indices.shape[0]
      
      # Remove unreferenced vertices
-@@ -209,28 +220,38 @@ def remesh_narrow_band_dc(
+-    unique_verts = torch.unique(quad_indices.reshape(-1))
++    # The referenced vertices, ascending as torch.unique returns them, found with a mask over the voxels instead of a
++    # sort of every quad corner.
++    referenced = torch.zeros((Nvox,), dtype=torch.bool, device=device)
++    for s in range(0, L, chunk):
++        referenced[quad_indices[s:s + chunk].reshape(-1).long()] = True
++    unique_verts = referenced.nonzero().squeeze(1).to(quad_indices.dtype)
++    del referenced
+     dual_verts = dual_verts[unique_verts]
+     vert_map = torch.zeros((Nvox,), dtype=torch.int32, device=device)
      vert_map[unique_verts] = torch.arange(unique_verts.shape[0], dtype=torch.int32, device=device)
-     quad_indices = vert_map[quad_indices]
+-    quad_indices = vert_map[quad_indices]
++    for s in range(0, L, chunk):   # remapped in place, chunk by chunk, rather than into a second full copy
++        quad_indices[s:s + chunk] = vert_map[quad_indices[s:s + chunk]]
      
 -    # Construct triangles
 +    # The voxel and grid-vertex tables are not used past this point.
@@ -111,3 +139,43 @@ index 272a6c1..f564a8e 100644
          
      # --------------------------------------------------------------------------
      # 8. Optional: Project back to exact surface
+diff --git a/src/simplify.cu b/src/simplify.cu
+index b5bbcbb..53e79a3 100644
+--- a/src/simplify.cu
++++ b/src/simplify.cu
+@@ -533,20 +533,30 @@ std::tuple<int, int> CuMesh::simplify_step(float lambda_edge_length, float lambd
+     std::chrono::high_resolution_clock::time_point start, end;
+ 
+     if (timing) start = std::chrono::high_resolution_clock::now();
+-    this->get_vertex_face_adjacency();
++    this->get_edges();
++    this->get_boundary_info();
++    // The rest of the step reads only the vertices, faces, edges, boundary flags and vertex-face adjacency, and resizes
++    // the scratch buffers before using them again, so the edge-face counts, the boundary list and the edge sort's
++    // scratch are freed here. The vertex-face adjacency is built after them, which keeps it out of the edge sort's peak.
++    this->edge2face_cnt.free();
++    this->boundaries.free();
++    this->temp_storage.free();
++    this->cub_temp_storage.free();
+     if (timing) {
+         CUDA_CHECK(cudaStreamSynchronize(stream));
+         end = std::chrono::high_resolution_clock::now();
+-        std::cout << "get_vertex_face_adjacency: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
++        std::cout << "get_edges: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
+     }
+ 
+     if (timing) start = std::chrono::high_resolution_clock::now();
+-    this->get_edges();
+-    this->get_boundary_info();
++    this->get_vertex_face_adjacency();
++    // Only the adjacency and its offsets are read past this point.
++    this->vert2face_cnt.free();
++    this->cub_temp_storage.free();
+     if (timing) {
+         CUDA_CHECK(cudaStreamSynchronize(stream));
+         end = std::chrono::high_resolution_clock::now();
+-        std::cout << "get_edges: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
++        std::cout << "get_vertex_face_adjacency: " << std::chrono::duration_cast<std::chrono::microseconds>(end - start).count() << " us" << std::endl;
+     }
+ 
+     if (timing) start = std::chrono::high_resolution_clock::now();
