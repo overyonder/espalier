@@ -9,8 +9,8 @@ An espalier is a fruit tree trained flat against a trellis, so a full-size tree 
 
 ![Microsoft's published catapult (top) and Espalier-2's at 1536 on a 16 GB card (bottom), rendered from the same cameras](docs/catapult-comparison.jpg)
 
-The top row is the GLB Microsoft publishes for this input on the TRELLIS.2 project page. The bottom row is Espalier-2's
-output from the same input image at 1536, with seed 42. Microsoft doesn't publish the seed or resolution of its
+The top row is Microsoft's published GLB for this input, from the TRELLIS.2 project page. The bottom row is
+Espalier-2's output from the same input image at 1536, with seed 42. Microsoft doesn't publish the seed or resolution of its
 gallery items, so the two are different samples of the same model. Up close, the 4096-pixel textures carry the same
 level of detail:
 
