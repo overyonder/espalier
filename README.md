@@ -148,5 +148,5 @@ This writes `out/model.glb`, plus `out/raw.pt` with the full-resolution mesh and
 
 ## Licence
 
-Espalier-2 is MIT licensed with an automated-use condition; see [LICENSE](LICENSE). TRELLIS.2, its weights, CuMesh, FlexGEMM, Pixal3D and its weights, MoGe and NATTEN are MIT licensed.
+Espalier-2 is licensed under MIT-SLOP, MIT with an automated-use condition; see [LICENSE](LICENSE). TRELLIS.2, its weights, CuMesh, FlexGEMM, Pixal3D and its weights, MoGe and NATTEN are MIT licensed.
 DINOv3 and RMBG-2.0 have their own licences.
