@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Builds over|yonder Espalier-2: Microsoft's TRELLIS.2 and its CUDA extensions at pinned commits, with Espalier-2's patches applied,
-# in a Python 3.10 virtual environment at ./.venv. With --pixal3d it also installs Tencent's Pixal3D, which is built on
-# TRELLIS.2, into the same environment.
+# Builds over|yonder Espalier-2.1: Tencent's Hunyuan3D-2.1 shape generation, Microsoft's TRELLIS.2 PBR texturing and
+# progressive projection painting on a 16 GB consumer GPU, with CuMesh and FlexGEMM extensions at pinned commits.
+# With --pixal3d it also installs Tencent's Pixal3D into the same environment.
 #
 # Needs: an NVIDIA driver, the CUDA toolkit 12.8 or later (CUDA_HOME, or nvcc on PATH), a GCC that toolkit supports,
 # git and uv, and for --pixal3d also cmake and make. TORCH_CUDA_ARCH_LIST defaults to the installed GPU's compute
@@ -12,10 +12,12 @@ src=$here/src
 venv=$here/.venv
 mkdir -p "$src"
 pixal3d=0
+flux=0
 for arg in "$@"; do
     case $arg in
         --pixal3d) pixal3d=1 ;;
-        *) echo "usage: $0 [--pixal3d]"; exit 1 ;;
+        --flux) flux=1 ;;
+        *) echo "usage: $0 [--pixal3d] [--flux]"; exit 1 ;;
     esac
 done
 
@@ -24,6 +26,8 @@ CUMESH_COMMIT=12289e1
 FLEXGEMM_COMMIT=6dd94a8
 NVDIFFRAST_TAG=v0.4.0
 NVDIFFREC_COMMIT=b296927
+HUNYUAN3D21_COMMIT=82920d65b706c646049ee587eb098b671a5dc622
+FLUX_COMMIT=66c403598c1d5300d0246a4e32049e29a39f60fe
 PIXAL3D_COMMIT=f7cf38429b0bd264f1995f0f8743a88b1c728b94
 # Pixal3D's requirements take MoGe from its default branch, whose current version conflicts with their trimesh pin; this
 # is the commit that was current on the requirements' date, 19 May 2026.
@@ -48,13 +52,14 @@ fetch https://github.com/JeffreyXiang/CuMesh.git CuMesh "$CUMESH_COMMIT" cumesh.
 fetch https://github.com/JeffreyXiang/FlexGEMM.git FlexGEMM "$FLEXGEMM_COMMIT"
 fetch https://github.com/NVlabs/nvdiffrast.git nvdiffrast "$NVDIFFRAST_TAG"
 fetch https://github.com/JeffreyXiang/nvdiffrec.git nvdiffrec "$NVDIFFREC_COMMIT"
+fetch https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git Hunyuan3D-2.1 "$HUNYUAN3D21_COMMIT"
 
 # PyTorch 2.8 with CUDA 12.8 and flash-attn 2.8.3 are the oldest builds with Blackwell (sm_120) kernels; Microsoft's
 # setup pins PyTorch 2.6 with CUDA 12.4 and flash-attn 2.7.3. transformers stays below 5, which this code predates.
 [ -d "$venv" ] || uv venv --quiet --python 3.10 "$venv"
 uv pip install --python "$venv" torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 uv pip install --python "$venv" setuptools wheel ninja imageio imageio-ffmpeg tqdm easydict opencv-python-headless \
-    trimesh plyfile "transformers==4.57.1" pillow kornia timm zstandard \
+    trimesh plyfile "transformers==4.57.1" pillow kornia timm zstandard diffusers accelerate scikit-image einops \
     "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"
 abi=$("$venv/bin/python" -c "import torch; print(str(torch._C._GLIBCXX_USE_CXX11_ABI).upper())")
 uv pip install --python "$venv" "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post2/flash_attn-2.8.3.post2%2Bcu12torch2.8cxx11abi${abi}-cp310-cp310-linux_x86_64.whl"
@@ -66,6 +71,13 @@ for ext in nvdiffrast:nvdiffrast nvdiffrec:nvdiffrec-render CuMesh:cumesh FlexGE
     echo "building $dir"
     uv pip install --python "$venv" --no-build-isolation --no-cache --no-deps --reinstall-package "$package" "$src/$dir"
 done
+
+# Dual Marching Cubes (diso) for GPU surface extraction
+if ! "$venv/bin/python" -c "import diso" 2>/dev/null; then
+    echo "building diso"
+    uv pip install --python "$venv" --no-build-isolation diso || echo "Notice: diso build failed; will fall back to scikit-image marching cubes if unavailable"
+fi
+
 site=$("$venv/bin/python" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
 grep -q CUMESH_REMESH_CHUNK "$site/cumesh/remeshing.py" && grep -q "del pts_vert" "$site/cumesh/remeshing.py" \
     && grep -q "edge2face_cnt.free" "$src/CuMesh/src/simplify.cu" || { echo "the installed CuMesh is missing Espalier-2's patch"; exit 1; }
@@ -77,6 +89,9 @@ for marker in stream_weights_from_file:models/__init__.py TRELLIS_DECODE_MLP_CHU
         TRELLIS_DECODE_TILE_SPLIT:models/sc_vaes/sparse_unet_vae.py clear_spatial_caches:pipelines/trellis2_image_to_3d.py; do
     grep -q "${marker%%:*}" "$src/TRELLIS.2/trellis2/${marker#*:}" || { echo "TRELLIS.2 is missing Espalier-2's patch"; exit 1; }
 done
+if [ $flux = 1 ]; then
+    fetch https://github.com/black-forest-labs/flux-3-image-klein.git flux-3-image-klein "$FLUX_COMMIT"
+fi
 if [ $pixal3d = 1 ]; then
     # Pixal3D's README steps 2 to 4 on the TRELLIS.2 base above. Its gradio requirement is only for its web demo.
     fetch https://github.com/TencentARC/Pixal3D.git Pixal3D "$PIXAL3D_COMMIT" pixal3d.patch
@@ -97,4 +112,4 @@ if [ $pixal3d = 1 ]; then
     done
     "$venv/bin/python" -c "import natten, moge, utils3d; utils3d.pt.depth_map_to_point_map" || { echo "Pixal3D's dependencies didn't install"; exit 1; }
 fi
-echo "Espalier-2 is installed. Run: $here/espalier <image> <output directory>"
+echo "Espalier-2.1 is installed. Run: $here/espalier <image> <output directory>"

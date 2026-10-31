@@ -1,3 +1,16 @@
 src/
 .venv/
 __pycache__/
+*.pyc
+*.pt
+*.ply
+*.blend
+*.blend1
+*.exr
+work/
+out/
+*.log
+.env*
+*auth*.json
+*.key
+*.pem
