@@ -46,8 +46,8 @@ def parse_args():
     p.add_argument("--no-rembg", action="store_true", help="skip RMBG-2.0; input must already have an alpha channel")
     p.add_argument("--dinov3", default=None, help="alternative DINOv3 Hugging Face repository")
     p.add_argument("--prompt-file", default=None, help="custom progressive repainting prompt file")
-    p.add_argument("--upscale", type=int, choices=[0, 2, 4], default=0,
-                   help="optional Real-ESRGAN texture atlas upscaling (default: 0, disabled)")
+    p.add_argument("--upscale", type=int, choices=[0, 2, 4], default=2,
+                   help="Real-ESRGAN atlas upscale factor (default: 2; use 0 to disable)")
 
     # Legacy Espalier-2 options:
     p.add_argument("--pipeline", default="1536_cascade", choices=["512", "1024", "1024_cascade", "1536_cascade"])
@@ -81,6 +81,15 @@ def run_stage(script_name, *stage_args):
 
 def main():
     a = parse_args()
+
+    if a.model == "hybrid" and a.paint == "flux":
+        print(
+            "Warning: Local FLUX and Qwen inpainting did not preserve reference "
+            "colours adequately in our comparison tests. Our tested workflow "
+            "requires API inpainting for good reference-colour fidelity.",
+            file=sys.stderr,
+            flush=True,
+        )
 
     # Determine output destinations
     if a.output.endswith(".glb"):

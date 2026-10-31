@@ -30,6 +30,10 @@ The detail pass runs multi-view projection painting over the 4096 texture atlas:
 - **Codex GPT-Image (`--paint gpt` or `--gpt-image`)**: Uses the ChatGPT plan's Codex endpoint (authenticating through local `~/.codex/auth.json`).
 - **Base PBR Only (`--paint none`)**: Skips the detail painting pass and exports the base TRELLIS.2 PBR texture.
 
+In our comparison tests, local FLUX and Qwen inpainting did not preserve reference colours adequately. Our tested workflow requires API inpainting for good reference-colour fidelity. FLUX remains the default local option.
+
+The detail pass applies 2× Real-ESRGAN atlas upscaling by default, producing an 8192×8192 albedo from the 4096×4096 bake. Use `--upscale 0` to retain the baked atlas.
+
 The final asset is always exported cleanly to `<output>/model.glb` (or the specified `.glb` path).
 
 ## Memory
@@ -102,7 +106,7 @@ Log in once with `hf auth login` before running. If your input image already has
 | `--octree` | `512` | Hunyuan3D-2.1 occupancy field resolution |
 | `--no-rembg` | off | Skip RMBG-2.0 (input image must already have an alpha channel) |
 | `--dinov3` | Meta repo | Alternative Hugging Face repo for DINOv3 |
-| `--upscale` | `0` | Optional Real-ESRGAN atlas super-resolution (`2` or `4` for 8192 textures; runs in fp16 < 500 MiB VRAM) |
+| `--upscale` | `2` | Real-ESRGAN albedo atlas super-resolution after detail painting: `2` doubles each dimension (4096 → 8192), `4` quadruples it (4096 → 16384), `0` disables it |
 | `--prompt-file` | prompts/progressive_paint.txt | Path to custom detail repainting prompt |
 | `--model` | `hybrid` | Pipeline architecture: `hybrid` (Espalier-2.1), `trellis2`, or `pixal3d` |
 
