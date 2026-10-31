@@ -9,6 +9,8 @@ __pycache__/
 *.exr
 work/
 out/
+Intermediate/
+*.so
 *.log
 .env*
 *auth*.json

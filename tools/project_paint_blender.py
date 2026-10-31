@@ -1,24 +1,24 @@
-"""Progressive projection painting's Blender side (driven by espalier's progressive painting pass).
+"""Progressive projection painting's Blender side (albedo_progressive.py drives it).
 
   blender -b --python project_paint_blender.py -- piece   <base.glb> <piece.blend>
   blender -b --python project_paint_blender.py -- render  <piece.blend> <dir> [views=orbit] [tiles=1] [res=1024]
-  (paint <dir>/views/<name>.png -> <dir>/gen/<name>.png with Codex image editing)
-  blender -b --python project_paint_blender.py -- project <piece.blend> <dir> [tex=2048] [match=1] [only=<view>] [blend=average|progressive]
+  (paint <dir>/views/<name>.png -> <dir>/gen/<name>.png with paint_views.py)
+  blender -b --python project_paint_blender.py -- project <piece.blend> <dir> [tex=2048] [only=<view>] [blend=progressive]
   blender -b --python project_paint_blender.py -- export  <textured.blend> <painted.glb>
 
 render: cameras orbit the piece (8 azimuths at 15 degrees elevation, 4 at 50, one from above), each optionally split into
 tiles x tiles sensor-shift cameras with the lens scaled up, so a tile is the same perspective at tiles-times the pixel
 density. Each camera writes the current base colour lit flat (views/<name>.png) and the surface position per pixel
 (pos/<name>.exr); cams.json holds the cameras.
-project: bakes the surface position and normal of every texel, projects each texel into every generated view, keeps it
-where that view's position pass sees the same point (visibility), weights it by how squarely and how centrally the view
-sees it, optionally colour-matches each view to its render of the base first, averages, falls back to the base where no
-view reaches, pads the UV islands, and writes <dir>/base_color.png and <dir>/textured.blend plus its texel density.
-blend=progressive (with only=<view>) blends each view in by w^4 / (w^4 + best^4) against a
-per-texel best-weight map kept in <dir>, instead of averaging every view at once; sharp=<k> sets that exponent.
-Views render in EEVEE; surface position and normal bakes run in Cycles and are cached in <dir>.
+project: uploads cached surface maps and the current atlas into CUDA, then applies the selected view with visibility,
+facing/edge weighting, progressive blending and UV padding. With no selection, applies the saved views in camera order.
+serve: the progressive driver keeps this Blender process and its CUDA atlas alive across render/project/export commands.
+Each projection writes base_color.png, best-<size>.npy, project.json and step/textured.blend for resuming.
+The overlap exponent is sharp=4 by default. freeze=<atlas mask.npy> protects previously painted surface texels.
+Views render in EEVEE; UV surface position and normal bakes run in Cycles once and are cached in <dir>.
+Run 6-albedo/build.sh once before direct Blender calls; albedo_progressive.py builds before starting the worker.
 """
-import bpy, bmesh, sys, os, json, math
+import bpy, bmesh, sys, os, json, math, ctypes
 import numpy as np
 from mathutils import Vector, Matrix
 
@@ -30,13 +30,23 @@ if mode == "piece":     # a starting albedo's GLB as the .blend the painter work
     for image in bpy.data.images: image.pack()
     bpy.ops.wm.save_as_mainfile(filepath=out, compress=True); sys.exit(0)
 if mode == "export":    # the painted .blend as a GLB
-    bpy.ops.wm.open_mainfile(filepath=src); bpy.ops.export_scene.gltf(filepath=out, export_format='GLB'); sys.exit(0)
+    bpy.ops.wm.open_mainfile(filepath=src)
+    for obj in bpy.context.scene.objects:
+        if obj.type == 'MESH':
+            for polygon in obj.data.polygons: polygon.use_smooth = True
+    bpy.ops.export_scene.gltf(filepath=out, export_format='GLB'); sys.exit(0)
 os.makedirs(out, exist_ok=True)
 
 bpy.ops.wm.read_factory_settings(use_empty=True)
-with bpy.data.libraries.load(src) as (f, t): t.objects = f.objects
-obj = [o for o in t.objects if o.type == 'MESH'][0]
-sc = bpy.context.scene; sc.collection.objects.link(obj)
+if os.path.realpath(src) == os.path.realpath(f"{out}/step/textured.blend"):
+    # Open the resume file as the main document so Blender permits saving back to the same path.
+    bpy.ops.wm.open_mainfile(filepath=src)
+    obj = next(o for o in bpy.context.scene.objects if o.type == 'MESH')
+    sc = bpy.context.scene
+else:
+    with bpy.data.libraries.load(src) as (f, t): t.objects = f.objects
+    obj = next(o for o in t.objects if o.type == 'MESH')
+    sc = bpy.context.scene; sc.collection.objects.link(obj)
 mat = obj.data.materials[0]
 base_node = next(n for n in mat.node_tree.nodes if n.type == 'TEX_IMAGE' and
                  any(l.to_socket.name == "Base Color" for l in n.outputs["Color"].links))
@@ -70,165 +80,193 @@ def geo(socket, scale, shift):
 PS = 1 / (2.2 * radius); PSHIFT = tuple(0.5 - c * PS for c in centre)
 def decode_pos(p): return (p - np.array(PSHIFT)) / PS
 M_COL, M_POS, M_NRM = emit_material("col", tex_colour), emit_material("pos", geo("Position", PS, PSHIFT)), emit_material("nrm", geo("Normal", 0.5, (0.5, 0.5, 0.5)))
-def use(m): obj.data.materials.clear(); obj.data.materials.append(m)
+
+def use(m):
+    obj.data.materials.clear(); obj.data.materials.append(m)
+
+def cameras(kind, tiles):
+    views = (
+        [(az, 15) for az in range(0, 360, 45)]
+        + [(az, 50) for az in (45, 135, 225, 315)]
+        + [(az, -50) for az in (0, 120, 240)]
+    )
+    fov = math.radians(30); dist = radius / math.sin(fov / 2) * 1.05
+    cams = []
+    for az, el in views:
+        d = Vector((math.cos(math.radians(az)) * math.cos(math.radians(el)), math.sin(math.radians(az)) * math.cos(math.radians(el)),
+                    math.sin(math.radians(el))))
+        loc = centre + d * dist
+        rot = (centre - loc).to_track_quat('-Z', 'Y').to_matrix().to_4x4()
+        mw = Matrix.Translation(loc) @ rot
+        # aim at the silhouette's centre and fit the lens to it, with 4% margin each side
+        w2c = np.array(mw.inverted()); pc = pts @ w2c[:3, :3].T + w2c[:3, 3]; sx_, sy_ = pc[:, 0] / -pc[:, 2], pc[:, 1] / -pc[:, 2]
+        cx_, cy_ = (sx_.max() + sx_.min()) / 2, (sy_.max() + sy_.min()) / 2
+        half = max(sx_.max() - sx_.min(), sy_.max() - sy_.min()) / 2 / 0.92
+        aim = (rot.to_3x3() @ Vector((cx_, cy_, -1))).normalized()
+        mw = Matrix.Translation(loc) @ aim.to_track_quat('-Z', 'Y').to_matrix().to_4x4()
+        lens = float(36 / (2 * half))
+        cam_prefix = f"a{az:03d}e{el:02d}" if el >= 0 else f"a{az:03d}em{abs(el):02d}"
+        for ty in range(tiles):
+            for tx in range(tiles):
+                # a tile: the same camera with the lens scaled by `tiles` and the sensor shifted onto that tile
+                sx = (tx + 0.5) / tiles - 0.5; sy = 0.5 - (ty + 0.5) / tiles
+                cams.append(dict(name=cam_prefix + (f"t{ty}{tx}" if tiles > 1 else ""), matrix=[list(r) for r in mw],
+                                 lens=lens * tiles, sensor=36.0, shift=[sx * tiles, sy * tiles]))
+    return cams
+
+def make_cam(c, res):
+    cd = bpy.data.cameras.new(c["name"]); cd.lens = c["lens"]; cd.sensor_width = c["sensor"]; cd.sensor_fit = 'HORIZONTAL'
+    cd.shift_x, cd.shift_y = c["shift"]; cd.clip_start = 0.01; cd.clip_end = 1000
+    co = bpy.data.objects.new(c["name"], cd); sc.collection.objects.link(co); co.matrix_world = Matrix(c["matrix"])
+    sc.camera = co; sc.render.resolution_x = sc.render.resolution_y = res
+    return co
+
+def render_camera(c, res, cached_position=False):
+    make_cam(c, res)
+    for sub in ("views", "pos"): os.makedirs(f"{out}/{sub}", exist_ok=True)
+    sc.render.engine = 'BLENDER_EEVEE'
+    use(M_COL); sc.eevee.taa_render_samples = 16; sc.render.filter_size = 1.5
+    sc.view_settings.view_transform = 'Standard'
+    sc.render.image_settings.file_format = 'PNG'; sc.render.image_settings.color_mode = 'RGBA'
+    sc.render.film_transparent = True; sc.render.filepath = f"{out}/views/{c['name']}.png"
+    bpy.ops.render.render(write_still=True)
+    if not cached_position or not os.path.exists(f"{out}/pos/{c['name']}.exr"):
+        use(M_POS); sc.eevee.taa_render_samples = 1; sc.render.filter_size = 0.0; sc.view_settings.view_transform = 'Raw'
+        sc.render.image_settings.file_format = 'OPEN_EXR'; sc.render.image_settings.color_depth = '32'
+        sc.render.image_settings.color_mode = 'RGBA'; sc.render.filepath = f"{out}/pos/{c['name']}.exr"
+        bpy.ops.render.render(write_still=True)
+    use(mat)
 
 if mode == "render":
-    res = int(opt.get("res", 1024)); sc.render.resolution_x = sc.render.resolution_y = res
-    tiles = int(opt.get("tiles", 1))
-    cams = []
-    # 8 azimuths at 15 degrees elevation, 4 at 50, one from above (85)
-    azimuths = [0, 45, 90, 135, 180, 225, 270, 315, 45, 135, 225, 315, 0]
-    elevations = [15] * 8 + [50] * 4 + [85]
-    cams_file = f"{out}/cams.json"
-    if not os.path.exists(cams_file):
-        for a, e in zip(azimuths, elevations):
-            ar, er = math.radians(a), math.radians(e)
-            eye = centre + Vector((math.cos(er) * math.sin(ar), -math.cos(er) * math.cos(ar), math.sin(er))) * (radius * 2.8)
-            fwd = (centre - eye).normalized(); up = Vector((0, 0, 1))
-            right = fwd.cross(up).normalized(); up = right.cross(fwd).normalized()
-            mat = Matrix((right, up, -fwd)).to_4x4(); mat.translation = eye
-            for ty in range(tiles):
-                for tx in range(tiles):
-                    shift = ((tx - (tiles - 1) / 2) / tiles, (ty - (tiles - 1) / 2) / tiles)
-                    tag = f"_t{tx}{ty}" if tiles > 1 else ""
-                    cams.append(dict(name=f"a{a:03d}e{e:02d}{tag}", az=a, el=e, tx=tx, ty=ty,
-                                     matrix=[list(r) for r in mat], lens=50.0 * tiles, sensor=36.0, shift=shift))
-        os.makedirs(f"{out}/views", exist_ok=True); os.makedirs(f"{out}/pos", exist_ok=True)
-        json.dump(dict(radius=radius, centre=list(centre), tiles=tiles, cams=cams), open(cams_file, "w"), indent=2)
+    tiles, res = int(opt.get("tiles", 1)), int(opt.get("res", 1024))
+    only = opt.get("only")
+    if only and os.path.exists(f"{out}/cams.json"):
+        meta = json.load(open(f"{out}/cams.json")); res = meta["res"]
+        cams = [c for c in meta["cams"] if c["name"] == only]
+    else: cams = cameras(opt.get("views", "orbit"), tiles)
+    for c in cams: render_camera(c, res)
+    if not only: json.dump(dict(res=res, tiles=tiles, cams=cams), open(f"{out}/cams.json", "w"), indent=1)
+    print("RENDERED", len(cams), "views")
+
+def bake(m, size, name):
+    img = bpy.data.images.new(name, size, size, float_buffer=True, alpha=True); img.generated_color = (0, 0, 0, 0)
+    use(m); n = m.node_tree.nodes.new("ShaderNodeTexImage"); n.image = img; m.node_tree.nodes.active = n
+    sc.render.engine = 'CYCLES'; sc.cycles.samples = 1; sc.render.bake.margin = 0
+    bpy.context.view_layer.objects.active = obj; obj.select_set(True)
+    bpy.ops.object.bake(type='EMIT')
+    result = pixels(img).reshape(size, size, 4)
+    m.node_tree.nodes.remove(n); bpy.data.images.remove(img)
+    if not np.any(result[..., :3]):
+        raise RuntimeError(f"Cycles returned an empty {name} surface bake; inspect its render errors")
+    return result
+
+def pixels(image):
+    data = np.empty(len(image.pixels), dtype=np.float32)
+    image.pixels.foreach_get(data)
+    return data
+
+def load(path):
+    i = bpy.data.images.load(path); i.colorspace_settings.name = 'Non-Color' if path.endswith(".exr") else 'sRGB'
+    w, h = i.size; p = pixels(i).reshape(h, w, i.channels)
+    bpy.data.images.remove(i); return p[::-1]   # top row first
+
+if mode in ("project", "serve"):
+    import time
+    size = int(opt.get("tex", 4096))
+    meta_path = f"{out}/cams.json"
+    if not os.path.exists(meta_path):
+        json.dump(dict(res=int(opt.get("res", 1254)), tiles=1, cams=cameras("orbit", 1)), open(meta_path, "w"))
+    meta = json.load(open(meta_path)); res = meta["res"]
+    cache = f"{out}/surface-{size}.npz"
+    if os.path.exists(cache):
+        with np.load(cache) as surface: P, Nm = surface["P"], surface["N"]
     else:
-        cams = json.load(open(cams_file))["cams"]
-    cam_data = bpy.data.cameras.new("cam"); cam_obj = bpy.data.objects.new("cam", cam_data); sc.collection.objects.link(cam_obj); sc.camera = cam_obj
-    cam_data.sensor_width = 36.0
-    only = opt.get("only", None)
-    for c in cams:
-        if only and c["name"] != only: continue
-        cam_obj.matrix_world = Matrix(c["matrix"])
-        cam_data.lens = c["lens"]; cam_data.shift_x, cam_data.shift_y = c["shift"]
-        view_path = f"{out}/views/{c['name']}.png"; pos_path = f"{out}/pos/{c['name']}.exr"
-        # base colour in EEVEE
-        if not os.path.exists(view_path):
-            sc.render.engine = 'BLENDER_EEVEE_NEXT'; use(M_COL)
-            sc.render.filepath = view_path; sc.render.image_settings.file_format = 'PNG'
-            sc.render.image_settings.color_mode = 'RGBA'
-            bpy.ops.render.render(write_still=True)
-        # surface position in Cycles (EEVEE doesn't write OpenEXR 32-bit floats properly)
-        if not os.path.exists(pos_path):
-            sc.render.engine = 'CYCLES'; use(M_POS)
-            sc.render.filepath = pos_path; sc.render.image_settings.file_format = 'OPEN_EXR'
-            sc.render.image_settings.color_mode = 'RGBA'; sc.render.image_settings.color_depth = '32'
-            sc.cycles.samples = 1
-            bpy.ops.render.render(write_still=True)
-        print("RENDERED", c["name"])
-
-if mode == "project":
-    size = int(opt.get("tex", 2048)); match = int(opt.get("match", 1))
-    blend = opt.get("blend", "average"); sharp = float(opt.get("sharp", 4.0))
-    only = opt.get("only", None)
-    res = json.load(open(f"{out}/cams.json"))
-    cams, tiles = res["cams"], res["tiles"]
-
-    def bake(socket, m, path):
-        if os.path.exists(path): return np.load(path)
-        use(m)
-        img = bpy.data.images.new(socket, size, size, float_buffer=True, alpha=True)
-        tn = m.node_tree.nodes.new("ShaderNodeTexImage"); tn.image = img; m.node_tree.nodes.active = tn
-        sc.render.engine = 'CYCLES'; sc.render.bake.use_selected_to_active = False
-        sc.cycles.bake_type = 'EMIT'; sc.cycles.samples = 1
-        bpy.ops.object.bake(type='EMIT')
-        arr = np.array(img.pixels[:], dtype=np.float32).reshape(size, size, 4)
-        np.save(path, arr); return arr
-
-    pos = decode_pos(bake("pos", M_POS, f"{out}/pos-bake.npy")[..., :3])
-    nrm = bake("nrm", M_NRM, f"{out}/nrm-bake.npy")[..., :3] * 2 - 1
-    valid = np.linalg.norm(nrm, axis=-1) > 0.5
-    pos, nrm = pos[valid], nrm[valid]
-    nrm /= np.linalg.norm(nrm, axis=1, keepdims=True)
-
-    # Blender image pixels are in [0, 1] sRGB (when read via pixels[:]), but math on them needs linear light
-    def srgb_to_lin(c): return np.where(c <= 0.04045, c / 12.92, ((c + 0.055) / 1.055) ** 2.4)
-    def lin_to_srgb(c):
-        c = np.clip(c, 0, 1)
-        return np.where(c <= 0.0031308, c * 12.92, 1.055 * (c ** (1 / 2.4)) - 0.055)
-
-    base = np.array(base_img.pixels[:], dtype=np.float32).reshape(base_img.size[1], base_img.size[0], 4)[..., :3]
-    if base.shape[0] != size:
-        # resample base to texture size
-        import cv2
-        base = cv2.resize(base, (size, size), interpolation=cv2.INTER_AREA)
-
-    def load(path):
-        img = bpy.data.images.load(path); arr = np.array(img.pixels[:], dtype=np.float32).reshape(img.size[1], img.size[0], img.channels)
-        bpy.data.images.remove(img); return arr
-
-    acc = np.zeros((len(pos), 3), np.float32); wsum = np.zeros(len(pos), np.float32)
-    best = np.zeros(len(pos), np.float32)
-    res = cams[0]["lens"] / (50.0 * tiles) * 1024     # view pixel res
-    res = int(round(res))
-    eps = 0.015 * radius     # visibility tolerance against the surface position pass
-
-    for c in cams:
-        if only and c["name"] != only: continue
-        g = f"{out}/gen/{c['name']}.png"
-        if not os.path.exists(g): continue
-        gen = load(g)[..., :3]   # any square size: an upscaled view is sampled at its own resolution
-        gres = gen.shape[0]; scale = gres / res
-        ren = load(f"{out}/views/{c['name']}.png"); rpos = load(f"{out}/pos/{c['name']}.exr"); rpos[..., :3] = decode_pos(rpos[..., :3])
-        alpha = ren[..., 3] > 0.5
-        if match:   # per-channel mean and spread of the generated view matched to the base render, over the object
-            step = max(1, int(round(scale)))
-            small = gen[::step, ::step][:res, :res]
-            for k in range(3):
-                gm, gs = small[..., k][alpha].mean(), small[..., k][alpha].std() + 1e-4
-                rm, rs = ren[..., k][alpha].mean(), ren[..., k][alpha].std() + 1e-4
-                gen[..., k] = np.clip((gen[..., k] - gm) * (rs / gs) + rm, 0, 1)
-        mw = np.array(c["matrix"]); w2c = np.linalg.inv(mw)
-        pc = pos @ w2c[:3, :3].T + w2c[:3, 3]
-        z = -pc[:, 2]; f = c["lens"] / c["sensor"]
-        xs = f * pc[:, 0] / np.maximum(z, 1e-6) - c["shift"][0]; ys = f * pc[:, 1] / np.maximum(z, 1e-6) - c["shift"][1]
-        u = (xs + 0.5) * res; v = (0.5 - ys) * res
-        inside = (z > 0) & (u >= 0) & (u < res - 1) & (v >= 0) & (v < res - 1)
-        ui, vi = np.clip(u.astype(int), 0, res - 1), np.clip(v.astype(int), 0, res - 1)
-        seen = inside & (rpos[vi, ui, 3] > 0.5) & (np.linalg.norm(rpos[vi, ui, :3] - pos, axis=1) < eps)
-        camloc = mw[:3, 3]; view = camloc - pos; dist = np.linalg.norm(view, axis=1); view /= dist[:, None]
-        cos = np.clip((nrm * view).sum(1), 0, 1)
-        edge = np.clip(np.minimum.reduce([u, v, res - 1 - u, res - 1 - v]) / (0.08 * res), 0, 1)
-        w = np.where(seen, cos ** 6 * edge, 0).astype(np.float32)
-        # bilinear sample of the generated view, at its own resolution
-        ug, vg = u * scale, v * scale
-        u0, v0 = np.floor(ug).astype(int).clip(0, gres - 2), np.floor(vg).astype(int).clip(0, gres - 2); fu, fv = (ug - u0)[:, None], (vg - v0)[:, None]
-        col = (gen[v0, u0] * (1 - fu) * (1 - fv) + gen[v0, u0 + 1] * fu * (1 - fv) + gen[v0 + 1, u0] * (1 - fu) * fv + gen[v0 + 1, u0 + 1] * fu * fv)
-        acc += srgb_to_lin(col) * w[:, None]; wsum += w; best = np.maximum(best, w)
-        print("PROJECTED", c["name"], int(seen.sum()), "texels seen")
-    out_lin = srgb_to_lin(np.clip(base, 0, 1)).copy()   # Blender holds sRGB images' pixels as sRGB values
-    lin = out_lin[valid]
-    if blend == "progressive":
-        # winner-take-most: a texel moves to this view in proportion to w^k / (w^k + best^k), where best is the strongest
-        # view that painted it before; k = 4 gives a narrow feather, k = 16 nearly blits the best view's pixels
-        state = f"{out}/best-{size}.npy"; best_prev = np.load(state) if os.path.exists(state) else np.zeros(len(pos), np.float32)
-        wv = np.where(wsum > 0, wsum, 0); alpha = (wv ** sharp / (wv ** sharp + best_prev ** sharp + 1e-12))[:, None]
-        newc = acc / np.maximum(wsum, 1e-6)[:, None]
-        lin = np.where(wsum[:, None] > 1e-4, newc * alpha + lin * (1 - alpha), lin)
-        np.save(state, np.maximum(best_prev, wv))
-        painted = np.maximum(best_prev, wv) > 1e-4
-    else:
-        painted = wsum > 1e-4; mix = np.clip(best / 0.05, 0, 1)[:, None]
-        lin = np.where(painted[:, None], (acc / np.maximum(wsum, 1e-6)[:, None]) * mix + lin * (1 - mix), lin)
-    out_lin[valid] = lin
-    tex = lin_to_srgb(out_lin)
-    # pad UV islands outward so mip-mapping and filtering never read the empty background
-    filled = valid.copy()
-    for _ in range(12):
-        acc2 = np.zeros_like(tex); n2 = np.zeros(filled.shape, np.float32)
-        for dy, dx in ((0, 1), (0, -1), (1, 0), (-1, 0)):
-            acc2 += np.roll(np.roll(tex * filled[..., None], dy, 0), dx, 1); n2 += np.roll(np.roll(filled, dy, 0), dx, 1)
-        grow = (~filled) & (n2 > 0); tex[grow] = acc2[grow] / n2[grow][:, None]; filled |= grow
-    img = bpy.data.images.new("base_color", size, size, alpha=True)
-    img.pixels[:] = np.concatenate([tex, np.ones((size, size, 1), np.float32)], 2).ravel()
-    img.filepath_raw = f"{out}/base_color.png"; img.file_format = 'PNG'; img.save()
-    # texel density: used texels over surface area (the piece is in metres)
-    bm = bmesh.new(); bm.from_mesh(obj.data); area = sum(f.calc_area() for f in bm.faces)
+        P = bake(M_POS, size, "P"); Nm = bake(M_NRM, size, "N"); np.savez(cache, P=P, N=Nm)
+    # This mask orders the saved compact weight vector; surface preparation and projection run in CUDA.
+    valid = np.einsum('ijk,ijk->ij', Nm[..., :3], Nm[..., :3]) > .01
+    if not valid.any(): raise RuntimeError("Cached surface bake contains no UV texels")
+    frozen = np.load(opt["freeze"]).astype(np.uint8) if "freeze" in opt else np.zeros((size, size), np.uint8)
+    if frozen.shape != valid.shape: raise ValueError("Frozen mask does not match the texture atlas")
+    best = np.zeros((size, size), np.float32); state = f"{out}/best-{size}.npy"
+    if os.path.exists(state): best[valid] = np.load(state)
+    if tuple(base_img.size) != (size, size): base_img.scale(size, size)
+    rgba = pixels(base_img).reshape(size, size, 4)
+    so_candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "Intermediate/project_gpu.so"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "../Intermediate/project_gpu.so"),
+    ]
+    so_path = next((p for p in so_candidates if os.path.isfile(p)), None)
+    if not so_path: raise FileNotFoundError("project_gpu.so not found")
+    native = ctypes.CDLL(so_path)
+    pointer = ctypes.c_void_p
+    native.projection_error.restype = ctypes.c_char_p
+    native.projection_create.argtypes = [ctypes.c_uint, pointer, pointer, pointer, pointer, pointer] + [ctypes.c_double] * 4
+    native.projection_create.restype = pointer
+    native.projection_paint.argtypes = [pointer, pointer, pointer, ctypes.c_uint, pointer, ctypes.c_uint]
+    native.projection_download.argtypes = [pointer, pointer, pointer, pointer]
+    native.projection_destroy.argtypes = [pointer]
+    projector = native.projection_create(size, P.ctypes.data, Nm.ctypes.data, rgba.ctypes.data, best.ctypes.data,
+                                         frozen.ctypes.data, PS, *PSHIFT)
+    if not projector: raise RuntimeError(native.projection_error().decode())
+    del P, Nm, frozen
+    counts = np.zeros(3, np.uint32)
+    bm = bmesh.new(); bm.from_mesh(obj.data); area = sum(f.calc_area() for f in bm.faces); bm.free()
     density = math.sqrt(valid.sum() / area)
-    print("COVERAGE %.1f%% of surface texels painted; texel density %.0f px/m at %d^2" % (100 * painted.mean(), density, size))
-    use(mat); base_node.image = img; img.pack()
-    bpy.ops.wm.save_as_mainfile(filepath=f"{out}/textured.blend", compress=True)
-    json.dump(dict(coverage=float(painted.mean()), density=density, tex=size), open(f"{out}/project.json", "w"))
+    os.makedirs(f"{out}/step", exist_ok=True)
+
+    def project_camera(name):
+        global base_img
+        c = next(c for c in meta["cams"] if c["name"] == name)
+        gen = np.ascontiguousarray(load(f"{out}/gen/{name}.png"))
+        rpos = np.ascontiguousarray(load(f"{out}/pos/{name}.exr"))
+        if gen.shape[0] != gen.shape[1] or gen.shape[2] != 4: raise ValueError("Painting must be square RGBA")
+        camera = np.array([*np.linalg.inv(np.array(c["matrix"], dtype=np.float64))[:3].ravel(),
+                           *np.array(c["matrix"])[:3, 3], c["lens"] / c["sensor"], *c["shift"], res,
+                           .004 * radius * 2, PS, *PSHIFT, float(opt.get("sharp", 4))], np.float64)
+        started = time.perf_counter()
+        if native.projection_paint(projector, camera.ctypes.data, gen.ctypes.data, gen.shape[0], rpos.ctypes.data, res):
+            raise RuntimeError(native.projection_error().decode())
+        elapsed = time.perf_counter() - started
+        if native.projection_download(projector, rgba.ctypes.data, best.ctypes.data, counts.ctypes.data):
+            raise RuntimeError(native.projection_error().decode())
+        # A fresh datablock gives both .blend checkpoints and glTF export the current packed PNG.
+        # Repacking an already packed source image can retain its original compressed bytes.
+        previous_image = base_img
+        base_img = bpy.data.images.new("base_color", size, size, alpha=True)
+        base_img.pixels.foreach_set(rgba.ravel()); base_img.update()
+        base_img.filepath_raw = f"{out}/base_color.png"; base_img.file_format = 'PNG'; base_img.save(); base_img.pack()
+        base_node.image = base_img
+        for node in M_COL.node_tree.nodes:
+            if node.type == 'TEX_IMAGE': node.image = base_img
+        if previous_image.users == 0: bpy.data.images.remove(previous_image)
+        np.save(state, best[valid])
+        use(mat); base_node.image = base_img
+        bpy.ops.wm.save_as_mainfile(filepath=f"{out}/step/textured.blend", compress=True)
+        coverage = float(counts[2]) / max(1, int(counts[1]))
+        json.dump(dict(coverage=coverage, density=density, tex=size), open(f"{out}/project.json", "w"))
+        print(f"GPU_PROJECT {name} {elapsed:.4f}s; checkpoint {time.perf_counter()-started:.3f}s; "
+              f"{counts[0]} texels seen; coverage {coverage:.1%}", flush=True)
+
+    try:
+        if mode == "project":
+            if opt.get("blend", "progressive") != "progressive": raise ValueError("Use progressive projection blending")
+            for c in meta["cams"]:
+                if not opt.get("only") or c["name"] == opt["only"]: project_camera(c["name"])
+        else:
+            def reply(value): print("PROJECTOR " + json.dumps(value), flush=True)
+            reply(dict(ready=True, cams=[c["name"] for c in meta["cams"]]))
+            for command in sys.stdin:
+                request = json.loads(command)
+                if request["op"] == "render":
+                    c = next(c for c in meta["cams"] if c["name"] == request["name"])
+                    render_camera(c, res, cached_position=True)
+                elif request["op"] == "project": project_camera(request["name"])
+                elif request["op"] == "export":
+                    use(mat)
+                    for polygon in obj.data.polygons: polygon.use_smooth = True
+                    bpy.ops.export_scene.gltf(filepath=request["path"], export_format='GLB')
+                elif request["op"] == "quit":
+                    reply(dict(done=True)); break
+                else: raise ValueError("Unknown projector command")
+                reply(dict(done=True))
+    finally: native.projection_destroy(projector)
