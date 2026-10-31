@@ -1,0 +1,12 @@
+[package]
+name = "object-shader-compile"
+version = "0.1.0"
+edition = "2024"
+[dependencies]
+naga = { version = "=29.0.4", features = ["wgsl-in", "spv-out"] }
+
+[lints.rust]
+warnings = "deny"
+unsafe_code = "deny"
+unreachable_pub = "deny"
+unused_must_use = "deny"
