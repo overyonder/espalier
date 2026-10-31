@@ -21,6 +21,7 @@ p.add_argument("out", help="output final GLB")
 p.add_argument("--model", default="flux", choices=["flux", "gpt"], help="image model (default: flux)")
 p.add_argument("--texture", type=int, default=4096, help="texture atlas size (default: 4096)")
 p.add_argument("--res", type=int, default=1254, help="render view resolution (default: 1254)")
+p.add_argument("--upscale", type=int, choices=[0, 2, 4], default=0, help="upscale texture atlas with Real-ESRGAN (default: 0, disabled)")
 p.add_argument("--prompt-file", default=None, help="path to custom painting prompt")
 p.add_argument("--flux-dir", default=None, help="path to flux-3-image-klein directory")
 a = p.parse_args()
@@ -44,9 +45,13 @@ print(f"== 7 15-view detail painting & resident GPU projection bake via {model_l
 # 1. Render 15 camera views if not already rendered
 cams_file = prog_dir / "cams.json"
 if not cams_file.is_file():
-    shutil.copy(tools_dir / "cams_template.json", cams_file)
+    from batch import fit_cameras, load_geometry
+    vertices, _ = load_geometry(Path(a.base), False)
+    camera_data = fit_cameras(vertices)
+    cams_file.write_text(json.dumps(camera_data, indent=2))
+else:
+    camera_data = json.loads(cams_file.read_text())
 
-camera_data = json.loads(cams_file.read_text())
 cams = camera_data["cams"]
 
 blender_bin = shutil.which("blender")
@@ -157,5 +162,12 @@ if pack_bin.is_file():
     ], check=True)
 else:
     shutil.copy(a.base, out_path)
+
+if a.upscale > 0:
+    print(f"Upscaling texture atlas with Real-ESRGAN (factor={a.upscale})...", flush=True)
+    sys.path.insert(0, str(tools_dir))
+    from upscale import load_model, upscale_glb
+    model = load_model()
+    upscale_glb(out_path, out_path, model, factor=a.upscale)
 
 print(f"detail painting complete -> {out_path}", flush=True)

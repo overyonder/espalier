@@ -186,9 +186,11 @@ def fit_cameras(vertices):
     # Eight orbit, four angled top and three angled underside views.
     import trimesh
 
-    bounds = torch.stack((vertices.amin(0), vertices.amax(0))).cpu().numpy()
-    corners = trimesh.bounds.corners(bounds)
-    points = np.stack((corners[:, 0], -corners[:, 2], corners[:, 1]), axis=1)
+    pts_cpu = vertices.cpu().numpy()
+    if len(pts_cpu) > 4000:
+        idx = np.linspace(0, len(pts_cpu) - 1, 4000, dtype=int)
+        pts_cpu = pts_cpu[idx]
+    points = np.stack((pts_cpu[:, 0], -pts_cpu[:, 2], pts_cpu[:, 1]), axis=1)
     template = json.loads(
         (GENERATOR / "tools/cams_template.json").read_text()
     )
@@ -200,7 +202,7 @@ def fit_cameras(vertices):
         rotation[:3, 3] = 0
         fov = np.degrees(2 * np.arctan(item["sensor"] / (2 * item["lens"])))
         transform = trimesh.scene.cameras.look_at(
-            points, [fov, fov], rotation=rotation, pad=1 / 0.88
+            points, [fov, fov], rotation=rotation, pad=1.03
         )
         cameras.append(
             {
@@ -219,9 +221,11 @@ def bottom_cameras(vertices, camera_data):
     """Three underside views, 120 degrees apart and 50 degrees below level."""
     import trimesh
 
-    bounds = torch.stack((vertices.amin(0), vertices.amax(0))).cpu().numpy()
-    corners = trimesh.bounds.corners(bounds)
-    points = np.stack((corners[:, 0], -corners[:, 2], corners[:, 1]), axis=1)
+    pts_cpu = vertices.cpu().numpy()
+    if len(pts_cpu) > 4000:
+        idx = np.linspace(0, len(pts_cpu) - 1, 4000, dtype=int)
+        pts_cpu = pts_cpu[idx]
+    points = np.stack((pts_cpu[:, 0], -pts_cpu[:, 2], pts_cpu[:, 1]), axis=1)
     source = camera_data["cams"][2]
     fov = np.degrees(2 * np.arctan(source["sensor"] / (2 * source["lens"])))
     cameras = []
@@ -233,7 +237,7 @@ def bottom_cameras(vertices, camera_data):
         rotation = np.eye(4)
         rotation[:3, :3] = np.stack((right, np.cross(back, right), back), axis=1)
         transform = trimesh.scene.cameras.look_at(
-            points, [fov, fov], rotation=rotation, pad=1 / 0.88
+            points, [fov, fov], rotation=rotation, pad=1.03
         )
         cameras.append(
             {

@@ -62,9 +62,10 @@ sc.render.resolution_x = sc.render.resolution_y = int(os.environ.get('RENDER_RES
 # that moves with the camera, and a rim light behind, with AgX tone mapping so form and small relief both read.
 w = bpy.data.worlds.new('w'); sc.world = w; w.use_nodes = True; nt = w.node_tree
 hdri_path = os.path.expanduser('~/code/models/TRELLIS.2/assets/hdri/forest.exr')
+hdri_strength = float(os.environ.get('HDRI_STRENGTH', '0.35'))
 if os.path.exists(hdri_path) and os.environ.get('FLAT') != '1':
     env = nt.nodes.new('ShaderNodeTexEnvironment'); env.image = bpy.data.images.load(hdri_path)
-    nt.links.new(env.outputs['Color'], nt.nodes['Background'].inputs['Color']); nt.nodes['Background'].inputs['Strength'].default_value = 0.08
+    nt.links.new(env.outputs['Color'], nt.nodes['Background'].inputs['Color']); nt.nodes['Background'].inputs['Strength'].default_value = hdri_strength
 else:
     nt.nodes['Background'].inputs['Color'].default_value = (1, 1, 1, 1)
     nt.nodes['Background'].inputs['Strength'].default_value = 1.0
@@ -74,20 +75,35 @@ if not passes: sc.view_settings.look = 'AgX - Medium High Contrast'
 def area(name, energy, size):
     light = bpy.data.lights.new(name, 'AREA'); light.energy = energy; light.size = size
     obj = bpy.data.objects.new(name, light); sc.collection.objects.link(obj); return obj
-key, rim = area('key', 160 * size ** 2, size * 0.6), area('rim', 60 * size ** 2, size * 0.5)
+key_energy = float(os.environ.get('KEY_ENERGY', 180 * size ** 2))
+rim_energy = float(os.environ.get('RIM_ENERGY', 70 * size ** 2))
+key, rim = area('key', key_energy, size * 0.6), area('rim', rim_energy, size * 0.5)
 if os.environ.get('FLAT') == '1':   # even white light from every side and no key or rim, for views an image model paints
     nt.nodes['Background'].inputs['Color'].default_value = (1, 1, 1, 1); nt.nodes['Background'].inputs['Strength'].default_value = 1.0
     if len(nt.nodes['Background'].inputs['Color'].links) > 0:
         nt.links.remove(nt.nodes['Background'].inputs['Color'].links[0])
     key.data.energy = rim.data.energy = 0
     sc.view_settings.look = 'None'
+
+target_offset = mathutils.Vector([float(x) for x in os.environ['TARGET_OFFSET'].split(',')]) if os.environ.get('TARGET_OFFSET') else mathutils.Vector((0, 0, 0))
+aim_target = centre + target_offset
+
 def aim(obj, azimuth, elevation, distance):
     a, e = math.radians(azimuth), math.radians(elevation)
-    obj.location = centre + mathutils.Vector((distance * math.cos(e) * math.sin(a), -distance * math.cos(e) * math.cos(a), distance * math.sin(e)))
-    obj.rotation_euler = (centre - obj.location).to_track_quat('-Z', 'Y').to_euler()
+    obj.location = aim_target + mathutils.Vector((distance * math.cos(e) * math.sin(a), -distance * math.cos(e) * math.cos(a), distance * math.sin(e)))
+    obj.rotation_euler = (aim_target - obj.location).to_track_quat('-Z', 'Y').to_euler()
+
 cam = bpy.data.objects.new('cam', bpy.data.cameras.new('cam')); sc.collection.objects.link(cam); sc.camera = cam
 views = [tuple(float(x) for x in v.split(':')) for v in os.environ['VIEWS'].split(',')] if os.environ.get('VIEWS') else [(az, 0.0) for az in (0, 90, 180, 270)]
-cam.data.type = 'ORTHO'; cam.data.ortho_scale = ((hi - lo).length if os.environ.get('VIEWS') else height) / FILL; cam.data.clip_end = size * 10
+cam.data.type = 'ORTHO'
+fill = float(os.environ.get('FILL', '0.92'))
+if os.environ.get('ORTHO_SCALE'):
+    cam.data.ortho_scale = float(os.environ['ORTHO_SCALE'])
+elif os.environ.get('VIEWS'):
+    cam.data.ortho_scale = (hi - lo).length * 0.72 / fill
+else:
+    cam.data.ortho_scale = height / fill
+cam.data.clip_end = size * 10
 for i, (az, el) in enumerate(views):              # glTF front (+Z) becomes Blender -Y; az 90 puts the front on the image's left
     aim(cam, az, el, size * 3)
     aim(key, az - 40, el + math.copysign(35, el or 1), size * 2.5); aim(rim, az + 150, 25, size * 2.5)   # the key stays on the camera's side of the horizon

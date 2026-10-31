@@ -102,6 +102,7 @@ Log in once with `hf auth login` before running. If your input image already has
 | `--octree` | `512` | Hunyuan3D-2.1 occupancy field resolution |
 | `--no-rembg` | off | Skip RMBG-2.0 (input image must already have an alpha channel) |
 | `--dinov3` | Meta repo | Alternative Hugging Face repo for DINOv3 |
+| `--upscale` | `0` | Optional Real-ESRGAN atlas super-resolution (`2` or `4` for 8192 textures; runs in fp16 < 500 MiB VRAM) |
 | `--prompt-file` | prompts/progressive_paint.txt | Path to custom detail repainting prompt |
 | `--model` | `hybrid` | Pipeline architecture: `hybrid` (Espalier-2.1), `trellis2`, or `pixal3d` |
 

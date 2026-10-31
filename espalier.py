@@ -46,6 +46,8 @@ def parse_args():
     p.add_argument("--no-rembg", action="store_true", help="skip RMBG-2.0; input must already have an alpha channel")
     p.add_argument("--dinov3", default=None, help="alternative DINOv3 Hugging Face repository")
     p.add_argument("--prompt-file", default=None, help="custom progressive repainting prompt file")
+    p.add_argument("--upscale", type=int, choices=[0, 2, 4], default=0,
+                   help="optional Real-ESRGAN texture atlas upscaling (default: 0, disabled)")
 
     # Legacy Espalier-2 options:
     p.add_argument("--pipeline", default="1536_cascade", choices=["512", "1024", "1024_cascade", "1536_cascade"])
@@ -128,7 +130,8 @@ def main():
         # Stage 7: Detail Painting (if requested)
         if a.paint in ("flux", "gpt"):
             paint_args = [base_trellis_glb, a.image, work, final_out,
-                          "--model", a.paint, "--texture", str(a.texture)]
+                          "--model", a.paint, "--texture", str(a.texture),
+                          "--upscale", str(a.upscale)]
             if a.prompt_file:
                 paint_args.extend(["--prompt-file", a.prompt_file])
             if a.flux_dir:
