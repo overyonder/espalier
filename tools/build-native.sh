@@ -26,3 +26,7 @@ read -ra extra_libraries <<< "${LDFLAGS:-}"
 "$CXX" -std=c++20 -O2 -Wall -Wextra -Werror "${headers[@]}" "${extra_headers[@]}" \
     "$root/tools/atlas_density.cpp" "${libraries[@]}" "${extra_libraries[@]}" \
     -o "$output/surfaces/atlas-density"
+
+"$CXX" -std=c++20 -O2 -Wall -Wextra -Werror "${headers[@]}" "${extra_headers[@]}" \
+    "$root/tools/match_base_colour.cpp" "${libraries[@]}" "${extra_libraries[@]}" \
+    -o "$output/surfaces/match-base-colour"

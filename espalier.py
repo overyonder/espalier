@@ -60,6 +60,7 @@ def parse_args():
     p.add_argument("--work-dir", help="directory for intermediate stage outputs")
     p.add_argument("--upscale", type=int, choices=[0, 2, 4], default=2,
                    help="Real-ESRGAN painting upscale before baking; atlas stays 4096 (default: 2; 0 disables)")
+    p.add_argument("--no-base-colour-match", action="store_true", help="disable matching fallback brightness and colour grade to painted views")
     p.add_argument("--texel-density-map", action="store_true",
                    help="write source-pixel density and UV occupancy beside the finished model")
 
@@ -191,6 +192,8 @@ def main():
                           "--model", a.paint, "--texture", str(a.texture),
                           "--upscale", str(a.upscale)]
             paint_args.extend(["--paint-base", a.paint_base])
+            if a.no_base_colour_match:
+                paint_args.append("--no-base-colour-match")
             if a.texel_density_map:
                 paint_args.append("--texel-density-map")
             for flag, value in (("--base-material", a.base_material), ("--cameras", a.cameras), ("--paintings", a.paintings), ("--painting-output", a.painting_output)):
