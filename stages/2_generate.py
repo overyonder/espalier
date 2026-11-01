@@ -22,7 +22,32 @@ sys.path.insert(0, shape_root)
 from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
 
 print(f"== 2 generate shape (Hunyuan3D-2.1, {a.steps} steps, octree {a.octree}, seed {a.seed})", flush=True)
-pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained("tencent/Hunyuan3D-2.1", device="cpu")
+# The SDK loader holds its checkpoint beside a full-precision parameter copy.
+# Use PyTorch's mapped checkpoint and Accelerate's empty parameter construction
+# for the large DiT; retain ordinary initialisation for VAE's optional keys.
+import yaml
+from accelerate import init_empty_weights
+from hy3dshape.pipelines import smart_load_model, instantiate_from_config
+config_path, checkpoint_path = smart_load_model("tencent/Hunyuan3D-2.1", subfolder="hunyuan3d-dit-v2-1", use_safetensors=False, variant="fp16")
+with open(config_path) as configuration:
+    config = yaml.safe_load(configuration)
+checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True, mmap=True)
+with init_empty_weights(include_buffers=False):
+    model = instantiate_from_config(config["model"])
+model.load_state_dict(checkpoint["model"], assign=True)
+if any(value.is_meta for value in model.state_dict().values()):
+    raise RuntimeError("Shape checkpoint left uninitialised model tensors")
+vae = instantiate_from_config(config["vae"])
+vae.load_state_dict(checkpoint["vae"], strict=False)
+conditioner = instantiate_from_config(config["conditioner"])
+if "conditioner" in checkpoint:
+    conditioner.load_state_dict(checkpoint["conditioner"])
+pipe = Hunyuan3DDiTFlowMatchingPipeline(
+    model=model, vae=vae, conditioner=conditioner,
+    image_processor=instantiate_from_config(config["image_processor"]),
+    scheduler=instantiate_from_config(config["scheduler"]), device="cpu", dtype=torch.float16)
+del checkpoint
+print("SHAPE_CHECKPOINT_LOADED without duplicate DiT parameter allocation", flush=True)
 pipe.device = torch.device("cuda")
 encode_cond = pipe.encode_cond
 

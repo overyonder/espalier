@@ -15,8 +15,8 @@ def load_paint_base(geometry_path, material_path=None):
         source = next(iter(material_scene.geometry.values()))
         if not (np.array_equal(mesh.vertices, source.vertices)
                 and np.array_equal(mesh.faces, source.faces)
-                and np.array_equal(mesh.visual.uv, source.visual.uv)):
-            raise ValueError("Material source must match the retained positions, indices and UVs exactly")
+                and np.allclose(mesh.visual.uv, source.visual.uv, rtol=0, atol=1e-7)):
+            raise ValueError("Material source must match the retained positions and indices exactly, and UVs within float32 round-trip precision")
         mesh.visual.material = source.visual.material
     if mesh.visual.material.baseColorTexture is None:
         raise ValueError("Painting base must retain a colour atlas for uncovered texels")
