@@ -15,9 +15,13 @@ Pipeline Stages (under stages/):
   4. Reduce      (stages/4_reduce.py):   CuMesh clean and decimation to target faces
   5. Unwrap      (stages/5_unwrap.py):   CuMesh xatlas UV unwrapping
   6. Base PBR    (stages/6_albedo.py):   TRELLIS.2 shape-conditioned PBR texturing (4096 atlas)
-  7. Detail Pass (stages/7_paint.py):    13-view progressive projection painting (FLUX.3 or Codex)
+  7. Detail Pass (stages/7_paint.py):    15-view resident projection painting (FLUX.3 or Codex)
 """
-import argparse, os, shutil, subprocess, sys
+import argparse
+import os
+import shutil
+import subprocess
+import sys
 
 here = os.path.dirname(os.path.abspath(__file__))
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
@@ -46,8 +50,18 @@ def parse_args():
     p.add_argument("--no-rembg", action="store_true", help="skip RMBG-2.0; input must already have an alpha channel")
     p.add_argument("--dinov3", default=None, help="alternative DINOv3 Hugging Face repository")
     p.add_argument("--prompt-file", default=None, help="custom progressive repainting prompt file")
+    p.add_argument("--paint-base", choices=["trellis", "normals"], default="trellis", help="painting input: textured TRELLIS render (default) or camera-space normals")
+    p.add_argument("--base-model", help="paint an existing textured GLB, preserving its mesh and UVs; skip shape and base-texture generation")
+    p.add_argument("--base-material", help="use a UV-identical GLB material while retaining --base-model geometry and normals")
+    p.add_argument("--cameras", help="reuse an exact saved camera rig")
+    p.add_argument("--paintings", help="reuse paintings from this directory (requires --cameras)")
+    p.add_argument("--painting-output", help="reuse and complete paintings in this directory; requires --cameras")
+    p.add_argument("--resume", action="store_true", help="resume completed stages in the output work directory")
+    p.add_argument("--work-dir", help="directory for intermediate stage outputs")
     p.add_argument("--upscale", type=int, choices=[0, 2, 4], default=2,
-                   help="Real-ESRGAN atlas upscale factor (default: 2; use 0 to disable)")
+                   help="Real-ESRGAN painting upscale before baking; atlas stays 4096 (default: 2; 0 disables)")
+    p.add_argument("--texel-density-map", action="store_true",
+                   help="write source-pixel density and UV occupancy beside the finished model")
 
     # Legacy Espalier-2 options:
     p.add_argument("--pipeline", default="1536_cascade", choices=["512", "1024", "1024_cascade", "1536_cascade"])
@@ -69,14 +83,37 @@ def parse_args():
         p.error("Pixal3D has only the 1024_cascade and 1536_cascade pipelines")
     if os.path.isdir(a.image) and a.model != "pixal3d":
         p.error("a views directory needs --model pixal3d")
+    if a.prompt_file and not os.path.isfile(a.prompt_file):
+        p.error(f"Prompt file does not exist: {a.prompt_file}")
+    if (a.paintings or a.painting_output) and not a.cameras:
+        p.error("--paintings and --painting-output require --cameras so projection matches the paintings")
+    if a.base_material and not a.base_model:
+        p.error("--base-material requires --base-model")
+    if a.paintings and a.painting_output:
+        p.error("Choose --paintings or --painting-output")
+    if a.base_model and a.model != "hybrid":
+        p.error("--base-model is supported by the hybrid pipeline")
+    if a.model == "hybrid" and a.texture != 4096:
+        p.error("The hybrid baker uses a 4096 atlas; --upscale changes source painting resolution")
+    if a.texel_density_map and (a.model != "hybrid" or a.paint == "none"):
+        p.error("--texel-density-map requires a painted hybrid run")
     return a
 
 
 def run_stage(script_name, *stage_args):
     """Executes a pipeline stage script in an isolated subprocess for VRAM reclamation."""
     script_path = os.path.join(here, "stages", script_name)
-    cmd = [sys.executable, script_path, *stage_args]
-    subprocess.run(cmd, check=True)
+    role = "SHAPE" if script_name in ("2_generate.py", "3_extract.py") else "TEXTURE"
+    python = os.environ.get(f"ESPALIER_{role}_PYTHON", sys.executable)
+    environment = os.environ.copy()
+    trellis = environment.get("ESPALIER_TRELLIS_ROOT", os.path.join(here, "src", "TRELLIS.2"))
+    shape = environment.get("ESPALIER_SHAPE_ROOT", os.path.join(here, "src", "Hunyuan3D-2.1"))
+    paths = [trellis, os.path.join(shape, "hy3dshape"), shape, environment.get("PYTHONPATH", "")]
+    environment["PYTHONPATH"] = os.pathsep.join(path for path in paths if path)
+    cmd = [python, script_path, *stage_args]
+    print(f"START {script_name}", flush=True)
+    subprocess.run(cmd, check=True, env=environment, timeout=3600)
+    print(f"DONE {script_name}", flush=True)
 
 
 def main():
@@ -100,7 +137,9 @@ def main():
         final_out = os.path.join(out_dir, "model.glb")
 
     os.makedirs(out_dir, exist_ok=True)
-    work = os.path.join(out_dir, "work")
+    work = os.path.abspath(a.work_dir) if a.work_dir else os.path.join(
+        out_dir, os.path.splitext(os.path.basename(final_out))[0] + ".work" if a.output.endswith(".glb") else "work"
+    )
     os.makedirs(work, exist_ok=True)
 
     cutout_png = os.path.join(work, "cutout.png")
@@ -111,36 +150,52 @@ def main():
     base_trellis_glb = os.path.join(work, "trellis.glb")
 
     if a.model == "hybrid":
+        def generate_stage(script, output, *args):
+            if a.base_model:
+                return
+            if a.resume and os.path.isfile(output) and os.path.getsize(output):
+                print(f"REUSE {output}", flush=True)
+                return
+            run_stage(script, *args)
+
         # Stage 1: Cutout
         cutout_args = [a.image, cutout_png]
         if a.no_rembg:
             cutout_args.append("--no-rembg")
-        run_stage("1_cutout.py", *cutout_args)
+        generate_stage("1_cutout.py", cutout_png, *cutout_args)
 
         # Stage 2: Shape Generation
-        run_stage("2_generate.py", cutout_png, field_pt,
+        generate_stage("2_generate.py", field_pt, cutout_png, field_pt,
                   "--steps", str(a.steps), "--octree", str(a.octree), "--seed", str(a.seed))
 
         # Stage 3: Surface Extraction
-        run_stage("3_extract.py", field_pt, dense_ply)
+        generate_stage("3_extract.py", dense_ply, field_pt, dense_ply)
 
         # Stage 4: Mesh Reduction & Cleaning
-        run_stage("4_reduce.py", dense_ply, reduced_ply, "--faces", str(a.faces))
+        generate_stage("4_reduce.py", reduced_ply, dense_ply, reduced_ply, "--faces", str(a.faces))
 
         # Stage 5: UV Unwrap
-        run_stage("5_unwrap.py", reduced_ply, unwrapped_glb)
+        generate_stage("5_unwrap.py", unwrapped_glb, reduced_ply, unwrapped_glb)
 
         # Stage 6: Base PBR Texture
         albedo_args = [cutout_png, dense_ply, unwrapped_glb, base_trellis_glb, "--texture", str(a.texture)]
         if a.dinov3:
             albedo_args.extend(["--dinov3", a.dinov3])
-        run_stage("6_albedo.py", *albedo_args)
+        generate_stage("6_albedo.py", base_trellis_glb, *albedo_args)
+        if a.base_model:
+            base_trellis_glb = os.path.abspath(a.base_model)
 
         # Stage 7: Detail Painting (if requested)
         if a.paint in ("flux", "gpt"):
             paint_args = [base_trellis_glb, a.image, work, final_out,
                           "--model", a.paint, "--texture", str(a.texture),
                           "--upscale", str(a.upscale)]
+            paint_args.extend(["--paint-base", a.paint_base])
+            if a.texel_density_map:
+                paint_args.append("--texel-density-map")
+            for flag, value in (("--base-material", a.base_material), ("--cameras", a.cameras), ("--paintings", a.paintings), ("--painting-output", a.painting_output)):
+                if value:
+                    paint_args.extend([flag, os.path.abspath(value)])
             if a.prompt_file:
                 paint_args.extend(["--prompt-file", a.prompt_file])
             if a.flux_dir:

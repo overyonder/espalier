@@ -1,0 +1,11 @@
+# Set BUILD_NVEP=0; install with the shared model Python and
+# --target ~/code/models/qwen-image-2.1/.runtime --no-deps.
+torchao==0.17.0
+flashinfer-python @ git+https://github.com/flashinfer-ai/flashinfer.git@975f90583d9ac8896db14cf0f26e99a853c2f136
+nvidia-cutlass-dsl==4.7.1
+nvidia-cutlass-dsl-libs-base==4.7.1
+nvidia-cutlass-dsl-libs-core==4.7.1
+nvidia-cutlass-dsl-libs-cu13==4.7.1
+nvidia-cuda-nvdisasm==13.4.92
+apache-tvm-ffi==0.1.14.post0
+nvidia-cudnn-frontend==1.29.0

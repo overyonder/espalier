@@ -22,13 +22,8 @@ class Binding(C.Structure):
 
 class Vulkan:
     def __init__(self):
-        so_candidates = [
-            Path(os.environ.get("RESIDENT_VULKAN_LIBRARY", "")),
-            ROOT.parent / "Intermediate/resident-depth/resident_vk.so",
-            ROOT.parent.parent / "Intermediate/resident-depth/resident_vk.so",
-        ]
-        so_path = next((p for p in so_candidates if p.is_file()), ROOT.parent / "Intermediate/resident-depth/resident_vk.so")
-        self.lib = C.CDLL(str(so_path))
+        library = os.environ.get("RESIDENT_VULKAN_LIBRARY") or str(ROOT.parent.parent / "Intermediate/resident-depth/resident_vk.so")
+        self.lib = C.CDLL(library)
         signatures = {
             "rd_create": (C.c_void_p, []),
             "rd_error": (C.c_char_p, []),
@@ -125,12 +120,7 @@ class Vulkan:
 
     def pipeline(self, name, bindings, entry="compress_bc7"):
         array = (Binding * len(bindings))(*(Binding(*b) for b in bindings))
-        shader_candidates = [
-            Path(os.environ.get("RESIDENT_SHADER_DIRECTORY", "")),
-            ROOT.parent / "Intermediate/resident-depth",
-            ROOT.parent.parent / "Intermediate/resident-depth",
-        ]
-        shader_dir = next((p for p in shader_candidates if p.is_dir()), ROOT.parent / "Intermediate/resident-depth")
+        shader_dir = Path(os.environ.get("RESIDENT_SHADER_DIRECTORY") or ROOT.parent.parent / "Intermediate/resident-depth")
         return self.call(
             "rd_pipeline",
             str(shader_dir / (name + ".spv")).encode(),
@@ -152,6 +142,7 @@ def bake(
     output_directory,
     context,
     flat_normals=False,
+    base_colour=None,
 ):
     from resident import render_depths
 
@@ -159,6 +150,10 @@ def bake(
     timings = {}
     started = time.perf_counter()
     try:
+        base_rgba = (base_colour or Image.new("RGBA", (1, 1), "black")).convert("RGBA")
+        base_image = gpu.call("rd_image", base_rgba.width, base_rgba.height, 1, 37)
+        base_upload = gpu.buffer(base_rgba.tobytes())
+        gpu.call("rd_copy_image", base_upload, base_image, 0)
         count = len(camera_data["cams"])
         if not 1 <= count <= 16 or len(paint_paths) != count or len(matrices) != count:
             raise ValueError("Matching camera transforms and paintings required (1–16)")
@@ -179,6 +174,10 @@ def bake(
                 "<19I", 4, 4, 4, 4, 4, 4, 4, 0, 1, 1, 1, 1, 0, 64, 64, 0, 0, 4, 3
             )
         )
+        # Painted foreground masks must survive input BC7 compression.
+        input_settings = gpu.buffer(
+            struct.pack("<19I", 4, 4, 4, 4, 4, 4, 4, 0, 1, 1, 1, 1, 0, 64, 64, 0, 0, 4, 4)
+        )
         uniforms = gpu.buffer(struct.pack("<4I", width, width, 0, 0))
         encoder = gpu.pipeline(
             "encode",
@@ -186,7 +185,7 @@ def bake(
                 (0, 0, 0, tables),
                 (0, 1, 1, encoded_input),
                 (0, 2, 0, uniforms),
-                (0, 3, 1, settings),
+                (0, 3, 1, input_settings),
                 (1, 0, 2, rgba_image),
             ],
         )
@@ -300,6 +299,7 @@ def bake(
                 (2, 2, 3, 0),
                 (2, 3, 0, cameras),
                 (2, 4, 0, inverse_cameras),
+                (2, 5, 2, base_image),
             ]
         )
         stage = time.perf_counter()

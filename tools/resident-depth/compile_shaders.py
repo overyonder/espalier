@@ -30,16 +30,16 @@ projection = (
         "uv*f32(cameras.metadata.x)/f32(cameras.metadata.y)", "uv*cameras.origins[i].w"
     )
     .replace(
-        "normal:vec3<f32>)->vec3<f32>{",
-        "normal:vec3<f32>,plane_normal:vec3<f32>)->vec3<f32>{",
+        "normal:vec3<f32>,base_uv:vec2<f32>)->vec3<f32>{",
+        "normal:vec3<f32>,base_uv:vec2<f32>,plane_normal:vec3<f32>)->vec3<f32>{",
     )
     .replace(
         "let z=ndc.z*.5+.5;",
         "let z=visibility_depth(point,plane_normal,i,ndc,pixel,dimensions);",
     )
     .replace(
-        "project_surface(point,normal)",
-        "project_surface(point,normal,cross(vertex_position(best_vertices.y)-vertex_position(best_vertices.x),vertex_position(best_vertices.z)-vertex_position(best_vertices.x)))",
+        "project_surface(point,normal,base_uv)",
+        "project_surface(point,normal,base_uv,cross(vertex_position(best_vertices.y)-vertex_position(best_vertices.x),vertex_position(best_vertices.z)-vertex_position(best_vertices.x)))",
     )
 )
 projection += "\n" + (root / "visibility.wgsl").read_text()

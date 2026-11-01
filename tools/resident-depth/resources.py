@@ -21,7 +21,7 @@ class Utilization(ctypes.Structure):
 
 class ResourceMonitor:
     def __init__(self):
-        self.nvml = ctypes.CDLL("/run/opengl-driver/lib/libnvidia-ml.so.1")
+        self.nvml = ctypes.CDLL(os.environ.get("NVML_LIBRARY", "libnvidia-ml.so.1"))
         if self.nvml.nvmlInit_v2() != 0:
             raise RuntimeError("NVML initialization failed")
         self.handle = ctypes.c_void_p()

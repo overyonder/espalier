@@ -629,6 +629,47 @@ extern "C" int rd_decode_png(const char *path, void *destination,
               size_t(height - 1 - y) * padded * 4;
   png_read_image(png, rows);
   png_read_end(png, info);
+  // Only the dark canvas connected to the image boundary is empty painting.
+  // Enclosed dark details, such as eyes, remain valid foreground.
+  std::vector<uint32_t> canvas;
+  canvas.reserve(size_t(width) * height);
+  std::vector<uint8_t> canvas_mask(size_t(width) * height);
+  auto mark_canvas = [&](uint32_t x, uint32_t y) {
+    auto *pixel = rows[y] + size_t(x) * 4;
+    const size_t index = size_t(y) * width + x;
+    if (!canvas_mask[index] &&
+        (pixel[3] < 128 || (pixel[0] <= 4 && pixel[1] <= 4 && pixel[2] <= 4))) {
+      canvas_mask[index] = 1;
+      pixel[3] = 0;
+      canvas.push_back(y * width + x);
+    }
+  };
+  for (uint32_t x = 0; x < width; ++x) {
+    mark_canvas(x, 0);
+    mark_canvas(x, height - 1);
+  }
+  for (uint32_t y = 0; y < height; ++y) {
+    mark_canvas(0, y);
+    mark_canvas(width - 1, y);
+  }
+  for (size_t next = 0; next < canvas.size(); ++next) {
+    const uint32_t x = canvas[next] % width, y = canvas[next] / width;
+    if (x)
+      mark_canvas(x - 1, y);
+    if (x + 1 < width)
+      mark_canvas(x + 1, y);
+    if (y)
+      mark_canvas(x, y - 1);
+    if (y + 1 < height)
+      mark_canvas(x, y + 1);
+  }
+  // Hidden RGB must not affect BC7 colour fitting around transparent contours.
+  for (uint32_t y = 0; y < height; ++y)
+    for (uint32_t x = 0; x < width; ++x) {
+      auto *pixel = rows[y] + size_t(x) * 4;
+      if (pixel[3] < 128)
+        pixel[0] = pixel[1] = pixel[2] = 0;
+    }
   png_destroy_read_struct(&png, &info, nullptr);
   std::fclose(file);
   std::free(rows);

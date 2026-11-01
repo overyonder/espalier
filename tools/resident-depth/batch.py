@@ -28,7 +28,7 @@ GENERATOR = Path(__file__).resolve().parents[2]
 
 
 def paint_missing(reference, depth_paths, destinations):
-    client = Path.home() / ".claude/skills/image-generation/scripts/chatgpt_image.py"
+    client = GENERATOR / "tools/chatgpt_image.py"
     prompt = Path(__file__).with_name("paint-prompt.txt")
 
     def generate(depth, destination):
@@ -187,9 +187,6 @@ def fit_cameras(vertices):
     import trimesh
 
     pts_cpu = vertices.cpu().numpy()
-    if len(pts_cpu) > 4000:
-        idx = np.linspace(0, len(pts_cpu) - 1, 4000, dtype=int)
-        pts_cpu = pts_cpu[idx]
     points = np.stack((pts_cpu[:, 0], -pts_cpu[:, 2], pts_cpu[:, 1]), axis=1)
     template = json.loads(
         (GENERATOR / "tools/cams_template.json").read_text()
@@ -222,9 +219,6 @@ def bottom_cameras(vertices, camera_data):
     import trimesh
 
     pts_cpu = vertices.cpu().numpy()
-    if len(pts_cpu) > 4000:
-        idx = np.linspace(0, len(pts_cpu) - 1, 4000, dtype=int)
-        pts_cpu = pts_cpu[idx]
     points = np.stack((pts_cpu[:, 0], -pts_cpu[:, 2], pts_cpu[:, 1]), axis=1)
     source = camera_data["cams"][2]
     fov = np.degrees(2 * np.arctan(source["sensor"] / (2 * source["lens"])))

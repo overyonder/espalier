@@ -4,8 +4,8 @@ set -euo pipefail
 here=$(dirname "$(readlink -f "$0")")
 output="$here/../../Intermediate/resident-depth"
 mkdir -p "$output"
-: "${EVAL_COMPILER:?Source object-generator/env.sh first}"
-: "${EVAL_CUDA_RUNTIME:?Source object-generator/env.sh first}"
+: "${EVAL_COMPILER:?Set EVAL_COMPILER to the C++ toolchain root}"
+: "${EVAL_CUDA_RUNTIME:?Set EVAL_CUDA_RUNTIME to the CUDA runtime root}"
 headers=${EVAL_VULKAN_HEADERS:-$(nix build --no-link --print-out-paths nixpkgs#vulkan-headers)}
 libpng=${EVAL_LIBPNG:-$(nix build --no-link --print-out-paths nixpkgs#libpng)}
 png_headers=${EVAL_PNG_HEADERS:-$(nix build --no-link --print-out-paths nixpkgs#libpng.dev)}

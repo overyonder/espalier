@@ -59,7 +59,7 @@ fetch https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git Hunyuan3D-2.1 "$HUNYU
 [ -d "$venv" ] || uv venv --quiet --python 3.10 "$venv"
 uv pip install --python "$venv" torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 uv pip install --python "$venv" setuptools wheel ninja imageio imageio-ffmpeg tqdm easydict opencv-python-headless \
-    trimesh plyfile "transformers==4.57.1" pillow kornia timm zstandard diffusers accelerate scikit-image einops \
+    trimesh plyfile basicsr==1.4.2 realesrgan==0.3.0 "transformers==4.57.1" pillow kornia timm zstandard diffusers accelerate scikit-image einops omegaconf \
     "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"
 abi=$("$venv/bin/python" -c "import torch; print(str(torch._C._GLIBCXX_USE_CXX11_ABI).upper())")
 uv pip install --python "$venv" "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post2/flash_attn-2.8.3.post2%2Bcu12torch2.8cxx11abi${abi}-cp310-cp310-linux_x86_64.whl"
@@ -75,7 +75,7 @@ done
 # Dual Marching Cubes (diso) for GPU surface extraction
 if ! "$venv/bin/python" -c "import diso" 2>/dev/null; then
     echo "building diso"
-    uv pip install --python "$venv" --no-build-isolation diso || echo "Notice: diso build failed; will fall back to scikit-image marching cubes if unavailable"
+    uv pip install --python "$venv" --no-build-isolation diso
 fi
 
 site=$("$venv/bin/python" -c "import sysconfig; print(sysconfig.get_paths()['purelib'])")
@@ -91,6 +91,10 @@ for marker in stream_weights_from_file:models/__init__.py TRELLIS_DECODE_MLP_CHU
 done
 if [ $flux = 1 ]; then
     fetch https://github.com/black-forest-labs/flux-3-image-klein.git flux-3-image-klein "$FLUX_COMMIT"
+    flux_venv="$src/flux-3-image-klein/.venv"
+    [ -d "$flux_venv" ] || uv venv --python 3.12 "$flux_venv"
+    uv pip install --python "$flux_venv/bin/python" -e "$src/flux-3-image-klein[nvfp4]" \
+        --extra-index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://flashinfer.ai/whl/cu130
 fi
 if [ $pixal3d = 1 ]; then
     # Pixal3D's README steps 2 to 4 on the TRELLIS.2 base above. Its gradio requirement is only for its web demo.
@@ -112,4 +116,5 @@ if [ $pixal3d = 1 ]; then
     done
     "$venv/bin/python" -c "import natten, moge, utils3d; utils3d.pt.depth_map_to_point_map" || { echo "Pixal3D's dependencies didn't install"; exit 1; }
 fi
+"$here/tools/build-native.sh"
 echo "Espalier-2.1 is installed. Run: $here/espalier <image> <output directory>"

@@ -10,6 +10,7 @@ struct Cameras { matrices:array<mat4x4<f32>,13>, origins:array<vec4<f32>,13>, me
 @group(2) @binding(1) var depths:texture_depth_2d_array;
 @group(2) @binding(2) var linear_sampler:sampler;
 @group(2) @binding(3) var<uniform> cameras:Cameras;
+@group(2) @binding(5) var base_colour:texture_2d<f32>;
 fn vertex_index(i:u32)->u32 {
  if(cameras.metadata.z==2u){return (index_data[i/2u]>>((i%2u)*16u))&65535u;}
  return index_data[i];
@@ -19,7 +20,7 @@ fn vertex_position(i:u32)->vec3<f32>{return vec3(positions[i*3u],-positions[i*3u
 fn vertex_normal(i:u32)->vec3<f32>{return vec3(normals[i*3u],-normals[i*3u+2u],normals[i*3u+1u]);}
 fn to_linear(c:vec3<f32>)->vec3<f32>{return select(c/12.92,pow((c+.055)/1.055,vec3(2.4)),c>=vec3(.04045));}
 fn to_srgb(c:vec3<f32>)->vec3<f32>{return select(c*12.92,1.055*pow(max(c,vec3(0)),vec3(1./2.4))-.055,c>=vec3(.0031308));}
-fn project_surface(point:vec3<f32>,normal:vec3<f32>)->vec3<f32>{
+fn project_surface(point:vec3<f32>,normal:vec3<f32>,base_uv:vec2<f32>)->vec3<f32>{
  var total=vec3(0.);var weights=0.;let n=normalize(normal);
  for(var i=0;i<13;i++){
   let cosine=dot(n,normalize(cameras.origins[i].xyz-point));if(cosine<.17364818){continue;}
@@ -34,9 +35,12 @@ fn project_surface(point:vec3<f32>,normal:vec3<f32>)->vec3<f32>{
   let edge=clamp(min(min(uv.x,uv.y),min(1.-uv.x,1.-uv.y))/.08,0.,1.);
   let weight=pow(cosine,10.)*edge;
   let input_uv=uv*f32(cameras.metadata.x)/f32(cameras.metadata.y);
-  total+=to_linear(textureSampleLevel(paintings,linear_sampler,input_uv,i,0.).rgb)*weight;weights+=weight;
+  let painted=textureSampleLevel(paintings,linear_sampler,input_uv,i,0.);
+  // The paint canvas is transparent or black outside the painted foreground.
+  if(painted.a<.5){continue;}
+  total+=to_linear(painted.rgb)*weight;weights+=weight;
  }
- if(weights>1.e-12){return to_srgb(total/weights);}return vec3(0.);
+ if(weights>1.e-12){return to_srgb(total/weights);}return textureSampleLevel(base_colour,linear_sampler,base_uv,0.).rgb;
 }
 fn project_pixel(coordinate:vec2<u32>)->vec4<f32>{
  let p=vec2<f32>(coordinate)+.5;let tile=min(coordinate/32u,vec2(127u));let bin=tile.y*128u+tile.x;
@@ -68,5 +72,6 @@ fn project_pixel(coordinate:vec2<u32>)->vec4<f32>{
   // glTF primitives without NORMAL have implicit flat triangle normals.
   normal=cross(vertex_position(best_vertices.y)-vertex_position(best_vertices.x),vertex_position(best_vertices.z)-vertex_position(best_vertices.x));
  }
- return vec4(floor(clamp(project_surface(point,normal),vec3(0.),vec3(1.))*255.+.5)/255.,1.);
+ let base_uv=(vertex_uv(best_vertices.x)*best_bary.x+vertex_uv(best_vertices.y)*best_bary.y+vertex_uv(best_vertices.z)*best_bary.z)/4096.;
+ return vec4(floor(clamp(project_surface(point,normal,base_uv),vec3(0.),vec3(1.))*255.+.5)/255.,1.);
 }

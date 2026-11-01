@@ -1,4 +1,5 @@
 // Package the resident baker's exact final PLY and BC7 KTX1, without remeshing.
+#include "painted_mesh.h"
 #include <nlohmann/json.hpp>
 #include <png.h>
 #define BCDEC_IMPLEMENTATION
@@ -25,7 +26,8 @@ static void require(bool valid, const char *message) {
     throw std::runtime_error(message);
 }
 
-static void offset_texture_references(Json &value, const std::string &key = "") {
+static void offset_texture_references(Json &value,
+                                      const std::string &key = "") {
   if (value.is_object()) {
     if (key.ends_with("Texture") && value.contains("index"))
       value["index"] = value["index"].get<size_t>() + 1;
@@ -118,36 +120,10 @@ static void pack_generated(const char *mesh_path, const char *atlas_path,
   const std::string normal_mode = timings.at("normal_mode");
   require(normal_mode == "implicit_flat" || normal_mode == "stored_vertex",
           "Unknown baker normal mode");
-  std::ifstream input(mesh_path, std::ios::binary);
-  require(input.good(), "Cannot open final PLY");
-  std::string line;
-  const auto expect = [&](const std::string &expected) {
-    require(static_cast<bool>(std::getline(input, line)) && line == expected,
-            "PLY does not match resident baker schema");
-  };
-  expect("ply");
-  expect("format binary_little_endian 1.0");
-  const auto element_count = [&](const std::string &prefix) {
-    require(static_cast<bool>(std::getline(input, line)) &&
-                line.starts_with(prefix),
-            "Missing PLY element");
-    size_t consumed = 0;
-    const auto count = std::stoull(line.substr(prefix.size()), &consumed);
-    require(consumed == line.size() - prefix.size() && count > 0 &&
-                count < UINT32_MAX,
-            "Invalid PLY element count");
-    return static_cast<size_t>(count);
-  };
-  const size_t vertices = element_count("element vertex ");
-  for (const char *name : {"x", "y", "z", "nx", "ny", "nz", "s", "t"})
-    expect(std::string("property float ") + name);
-  const size_t faces = element_count("element face ");
-  expect("property list uchar int vertex_indices");
-  expect("end_header");
-  Bytes binary(vertices * 32);
-  input.read(reinterpret_cast<char *>(binary.data()),
-             static_cast<std::streamsize>(binary.size()));
-  require(input.good(), "Truncated PLY vertices");
+  auto mesh = painted_mesh::load(mesh_path);
+  const size_t vertices = mesh.vertex_bytes.size() / 32;
+  const size_t faces = mesh.triangles.size();
+  Bytes binary = std::move(mesh.vertex_bytes);
   std::array<float, 3> minimum{}, maximum{};
   minimum.fill(std::numeric_limits<float>::infinity());
   maximum.fill(-std::numeric_limits<float>::infinity());
@@ -159,17 +135,9 @@ static void pack_generated(const char *mesh_path, const char *atlas_path,
       maximum[axis] = std::max(maximum[axis], value);
     }
   const size_t index_start = binary.size();
-  for (size_t face = 0; face < faces; ++face) {
-    require(input.get() == 3, "Expected triangle in final PLY");
-    for (int corner = 0; corner < 3; ++corner) {
-      uint32_t index;
-      input.read(reinterpret_cast<char *>(&index), 4);
-      require(input.good() && index < vertices, "Invalid final PLY triangle");
+  for (const auto &triangle : mesh.triangles)
+    for (uint32_t index : triangle)
       append_u32(binary, index);
-    }
-  }
-  require(input.peek() == std::char_traits<char>::eof(),
-          "Unexpected data after PLY faces");
   const Bytes png = decode_atlas_png(atlas_path);
   const size_t image_start = binary.size();
   binary.insert(binary.end(), png.begin(), png.end());
@@ -245,9 +213,10 @@ static void pack_generated(const char *mesh_path, const char *atlas_path,
             "Material source must be GLB 2");
     const size_t json_length = u32(source_bytes, 12);
     require(u32(source_bytes, 16) == 0x4e4f534a &&
-                28 + json_length <= source_bytes.size(), "Invalid source GLB JSON");
+                28 + json_length <= source_bytes.size(),
+            "Invalid source GLB JSON");
     const auto source = Json::parse(source_bytes.begin() + 20,
-                                   source_bytes.begin() + 20 + json_length);
+                                    source_bytes.begin() + 20 + json_length);
     const size_t source_start = 28 + json_length;
     const size_t source_length = u32(source_bytes, 20 + json_length);
     require(u32(source_bytes, 24 + json_length) == 0x004e4942 &&
@@ -259,7 +228,8 @@ static void pack_generated(const char *mesh_path, const char *atlas_path,
     const size_t view_offset = document["bufferViews"].size();
     binary.insert(binary.end(), source_bytes.begin() + source_start,
                   source_bytes.begin() + source_start + source_length);
-    while (binary.size() % 4) binary.push_back(0);
+    while (binary.size() % 4)
+      binary.push_back(0);
     for (auto view : source.at("bufferViews")) {
       require(view.at("buffer") == 0, "External source buffers unsupported");
       view["byteOffset"] = view.value("byteOffset", size_t{0}) + buffer_offset;
@@ -275,9 +245,11 @@ static void pack_generated(const char *mesh_path, const char *atlas_path,
       texture["source"] = texture["source"].get<size_t>() + 1;
       document["textures"].push_back(texture);
     }
-    if (source.contains("samplers")) document["samplers"] = source["samplers"];
+    if (source.contains("samplers"))
+      document["samplers"] = source["samplers"];
     for (const auto *key : {"extensionsUsed", "extensionsRequired"})
-      if (source.contains(key)) document[key] = source[key];
+      if (source.contains(key))
+        document[key] = source[key];
     auto retained = source["materials"][0];
     offset_texture_references(retained);
     retained["pbrMetallicRoughness"]["baseColorTexture"] = {{"index", 0}};
@@ -314,7 +286,8 @@ int main(int argc, char **argv) {
     require(argc == 5 || argc == 6,
             "Usage: pack-generated sparse-uv.ply atlas-bc7.ktx "
             "bake-timings.json OUTPUT.glb [MATERIAL_SOURCE.glb]");
-    pack_generated(argv[1], argv[2], argv[3], argv[4], argc == 6 ? argv[5] : nullptr);
+    pack_generated(argv[1], argv[2], argv[3], argv[4],
+                   argc == 6 ? argv[5] : nullptr);
   } catch (const std::exception &error) {
     std::cerr << error.what() << '\n';
     return 1;

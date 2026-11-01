@@ -15,13 +15,37 @@ p.add_argument("--seed", type=int, default=12345, help="sampling seed (default: 
 a = p.parse_args()
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(here, "src", "Hunyuan3D-2.1", "hy3dshape"))
-sys.path.insert(0, os.path.join(here, "src", "Hunyuan3D-2.1"))
+shape_root = os.environ.get("ESPALIER_SHAPE_ROOT", os.path.join(here, "src", "Hunyuan3D-2.1"))
+sys.path.insert(0, os.path.join(shape_root, "hy3dshape"))
+sys.path.insert(0, shape_root)
 
 from hy3dshape.pipelines import Hunyuan3DDiTFlowMatchingPipeline
 
 print(f"== 2 generate shape (Hunyuan3D-2.1, {a.steps} steps, octree {a.octree}, seed {a.seed})", flush=True)
-pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained("tencent/Hunyuan3D-2.1")
+pipe = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained("tencent/Hunyuan3D-2.1", device="cpu")
+pipe.device = torch.device("cuda")
+encode_cond = pipe.encode_cond
+
+def encode_with_offload(*args, **kwargs):
+    pipe.vae.to("cpu")
+    pipe.model.to("cpu")
+    torch.cuda.empty_cache()
+    pipe.conditioner.to("cuda")
+    condition = encode_cond(*args, **kwargs)
+    pipe.conditioner.to("cpu")
+    torch.cuda.empty_cache()
+    pipe.model.to("cuda")
+    return condition
+
+pipe.encode_cond = encode_with_offload
+
+def load_decoder(module, _inputs):
+    pipe.model.to("cpu")
+    pipe.conditioner.to("cpu")
+    torch.cuda.empty_cache()
+    module.to("cuda")
+
+pipe.vae.register_forward_pre_hook(load_decoder)
 
 class FieldSaved(Exception):
     pass

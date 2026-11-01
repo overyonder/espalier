@@ -16,7 +16,7 @@ serve: the progressive driver keeps this Blender process and its CUDA atlas aliv
 Each projection writes base_color.png, best-<size>.npy, project.json and step/textured.blend for resuming.
 The overlap exponent is sharp=4 by default. freeze=<atlas mask.npy> protects previously painted surface texels.
 Views render in EEVEE; UV surface position and normal bakes run in Cycles once and are cached in <dir>.
-Run 6-albedo/build.sh once before direct Blender calls; albedo_progressive.py builds before starting the worker.
+Run tools/build_gpu.sh once before direct Blender calls.
 """
 import bpy, bmesh, sys, os, json, math, ctypes
 import numpy as np
