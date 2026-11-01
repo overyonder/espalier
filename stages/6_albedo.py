@@ -54,7 +54,15 @@ def generate_texture(image_path, resolution, texture_size, shape_path, unwrapped
     cond = timed('image conditioning', lambda: pipeline.get_cond([image], 512 if resolution == 512 else 1024))
     shape_latent = timed('voxelise and encode the shape mesh', lambda: pipeline.encode_shape_slat(shape_normalised, resolution))
     texture = timed('generate texture latent', lambda: pipeline.sample_tex_slat(cond, pipeline.models[f'tex_slat_flow_model_{resolution}'], shape_latent, {}))
+    del cond, shape_latent
+    torch.cuda.empty_cache()
     voxels = timed('decode PBR voxels', lambda: pipeline.decode_tex_slat(texture))
+    # The atlas samples only decoded features and coordinates. Release decoder
+    # topology caches and allocator blocks before nvdiffrast allocates outside
+    # PyTorch's caching allocator.
+    del texture
+    voxels.clear_spatial_cache()
+    torch.cuda.empty_cache()
 
     def bake():
         vertices = torch.tensor(normalise(np.asarray(unwrapped.vertices)), dtype=torch.float32).cuda()
