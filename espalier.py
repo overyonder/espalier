@@ -52,7 +52,7 @@ def parse_args():
     p.add_argument("--prompt-file", default=None, help="custom progressive repainting prompt file")
     p.add_argument("--paint-base", choices=["trellis", "normals"], default="trellis", help="painting input: textured TRELLIS render (default) or camera-space normals")
     p.add_argument("--base-model", help="paint an existing textured GLB, preserving its mesh and UVs; skip shape and base-texture generation")
-    p.add_argument("--base-material", help="use a UV-identical GLB material while retaining --base-model geometry and normals")
+    p.add_argument("--base-material", help="use a UV-identical material for painting and colour fallback; retain --base-model geometry, normals and output material")
     p.add_argument("--cameras", help="reuse an exact saved camera rig")
     p.add_argument("--paintings", help="reuse paintings from this directory (requires --cameras)")
     p.add_argument("--painting-output", help="reuse and complete paintings in this directory; requires --cameras")

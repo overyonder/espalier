@@ -1,6 +1,7 @@
 """Upscale camera paintings with the Real-ESRGAN SDK before atlas projection."""
 
 import argparse
+import json
 import os
 import sys
 from pathlib import Path
@@ -20,6 +21,8 @@ def main():
     parser.add_argument("source", type=Path)
     parser.add_argument("dest", type=Path)
     parser.add_argument("--factor", type=int, choices=[2, 4], default=2)
+    parser.add_argument("--overwrite", action="store_true", help="recompute existing outputs")
+    parser.add_argument("--cameras", type=Path, help="upscale only views named in this saved camera rig")
     parser.add_argument("--tile", type=int, default=512)
     shape = Path(os.environ.get("ESPALIER_SHAPE_ROOT", Path(__file__).resolve().parents[1] / "src/Hunyuan3D-2.1"))
     parser.add_argument("--weights", type=Path, default=os.environ.get(
@@ -32,7 +35,9 @@ def main():
     if args.source.resolve() == args.dest.resolve():
         parser.error("Preserve source paintings by choosing a separate destination")
     if args.source.is_dir():
-        sources = sorted(args.source.glob("*.png"))
+        sources = ([args.source / (camera["name"] + ".png")
+                    for camera in json.loads(args.cameras.read_text())["cams"]]
+                   if args.cameras else sorted(args.source.glob("*.png")))
         args.dest.mkdir(parents=True, exist_ok=True)
     else:
         sources = [args.source]
@@ -50,11 +55,13 @@ def main():
             pixels = np.ascontiguousarray(np.array(opaque.convert("RGB"))[..., ::-1])
             alpha = rgba.getchannel("A") if "A" in image.getbands() else None
             width, height = image.size
-        if destination.is_file():
+        if (destination.is_file() and not args.overwrite
+                and destination.stat().st_mtime_ns >= max(source.stat().st_mtime_ns, args.weights.stat().st_mtime_ns)):
             with Image.open(destination) as saved:
                 saved.verify()
             with Image.open(destination) as saved:
-                if saved.size == (width * args.factor, height * args.factor):
+                if (saved.size == (width * args.factor, height * args.factor)
+                        and saved.mode == ("RGBA" if alpha is not None else "RGB")):
                     print(f"UPSCALE_REUSE {index}/{len(sources)} {destination}", flush=True)
                     continue
         print(f"UPSCALE_START {index}/{len(sources)} {source}", flush=True)

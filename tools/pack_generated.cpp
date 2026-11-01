@@ -12,6 +12,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -26,16 +27,18 @@ static void require(bool valid, const char *message) {
     throw std::runtime_error(message);
 }
 
-static void offset_texture_references(Json &value,
-                                      const std::string &key = "") {
+static void
+remap_texture_references(Json &value,
+                         const std::function<size_t(size_t)> &texture_index,
+                         const std::string &key = "") {
   if (value.is_object()) {
     if (key.ends_with("Texture") && value.contains("index"))
-      value["index"] = value["index"].get<size_t>() + 1;
+      value["index"] = texture_index(value["index"].get<size_t>());
     for (auto &[name, child] : value.items())
-      offset_texture_references(child, name);
+      remap_texture_references(child, texture_index, name);
   } else if (value.is_array()) {
     for (auto &child : value)
-      offset_texture_references(child);
+      remap_texture_references(child, texture_index);
   }
 }
 
@@ -224,34 +227,59 @@ static void pack_generated(const char *mesh_path, const char *atlas_path,
             "Invalid source GLB binary");
     require(source.at("materials").size() == 1,
             "Pack source materials into one UV layout before baking");
-    const size_t buffer_offset = binary.size();
-    const size_t view_offset = document["bufferViews"].size();
-    binary.insert(binary.end(), source_bytes.begin() + source_start,
-                  source_bytes.begin() + source_start + source_length);
-    while (binary.size() % 4)
-      binary.push_back(0);
-    for (auto view : source.at("bufferViews")) {
-      require(view.at("buffer") == 0, "External source buffers unsupported");
-      view["byteOffset"] = view.value("byteOffset", size_t{0}) + buffer_offset;
-      document["bufferViews"].push_back(view);
-    }
-    for (auto image : source.value("images", Json::array())) {
+    const auto source_images = source.value("images", Json::array());
+    const auto source_textures = source.value("textures", Json::array());
+    const size_t missing = std::numeric_limits<size_t>::max();
+    std::vector<size_t> image_indices(source_images.size(), missing);
+    std::vector<size_t> texture_indices(source_textures.size(), missing);
+    auto copy_image = [&](size_t index) {
+      require(index < source_images.size(), "Source image index out of range");
+      if (image_indices[index] != missing)
+        return image_indices[index];
+      auto image = source_images[index];
       require(image.contains("bufferView"), "Source images must be embedded");
-      image["bufferView"] = image["bufferView"].get<size_t>() + view_offset;
+      const auto &view =
+          source.at("bufferViews").at(image["bufferView"].get<size_t>());
+      require(view.at("buffer") == 0, "External source buffers unsupported");
+      const size_t offset = view.value("byteOffset", size_t{0});
+      const size_t length = view.at("byteLength");
+      require(offset <= source_length && length <= source_length - offset,
+              "Source image exceeds binary chunk");
+      image["bufferView"] = document["bufferViews"].size();
+      document["bufferViews"].push_back({{"buffer", 0},
+                                         {"byteOffset", binary.size()},
+                                         {"byteLength", length}});
+      binary.insert(binary.end(), source_bytes.begin() + source_start + offset,
+                    source_bytes.begin() + source_start + offset + length);
+      while (binary.size() % 4)
+        binary.push_back(0);
+      const size_t destination = document["images"].size();
       document["images"].push_back(image);
-    }
-    for (auto texture : source.value("textures", Json::array())) {
+      image_indices[index] = destination;
+      return destination;
+    };
+    auto copy_texture = [&](size_t index) {
+      require(index < source_textures.size(),
+              "Source texture index out of range");
+      if (texture_indices[index] != missing)
+        return texture_indices[index];
+      auto texture = source_textures[index];
       require(texture.contains("source"), "Source texture must name its image");
-      texture["source"] = texture["source"].get<size_t>() + 1;
+      texture["source"] = copy_image(texture["source"].get<size_t>());
+      const size_t destination = document["textures"].size();
       document["textures"].push_back(texture);
-    }
+      texture_indices[index] = destination;
+      return destination;
+    };
     if (source.contains("samplers"))
       document["samplers"] = source["samplers"];
     for (const auto *key : {"extensionsUsed", "extensionsRequired"})
       if (source.contains(key))
         document[key] = source[key];
     auto retained = source["materials"][0];
-    offset_texture_references(retained);
+    // The new atlas replaces this image; copy only maps still used elsewhere.
+    retained["pbrMetallicRoughness"].erase("baseColorTexture");
+    remap_texture_references(retained, copy_texture);
     retained["pbrMetallicRoughness"]["baseColorTexture"] = {{"index", 0}};
     retained["pbrMetallicRoughness"]["baseColorFactor"] = {1, 1, 1, 1};
     document["materials"][0] = retained;

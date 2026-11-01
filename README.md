@@ -38,7 +38,7 @@ The detail pass uses the Real-ESRGAN SDK with x4plus weights, 512-pixel tiles, 1
 
 Add `--texel-density-map` to write `<model>-texel-density.png` and a TOML summary beside the finished GLB. The map compares final atlas texels with pixels in the sharpest visible source painting, accounting for occlusion and the baker's grazing cutoff. Blue is 0.5 texels per source pixel, cyan 1, green 2, yellow 4, orange 8 and red 16 or more. Grey marks the baker's four-texel gutter, black is outside the padded charts, and magenta has no eligible camera view. The summary separates UV occupancy, gutter and unassigned space and reports density percentiles. This measures the projection sources, independently of gameplay camera distance.
 
-The baker retains the base colour atlas wherever no eligible painted foreground reaches the mesh. Transparent pixels and the empty black painting canvas do not overwrite that base. Hidden RGB under transparency is removed before upscaling and input compression. An existing `--base-model` keeps its geometry, UV layout and stored or implicit normals. Use `--base-material TRELLIS.glb` when a separately textured export has the same positions, indices and UVs but omitted those normals; this is validated before painting. The base texture stage also retains the input mesh rather than reconstructing it when attaching its material.
+The baker retains the base colour atlas wherever no eligible painted foreground reaches the mesh. Transparent pixels and the empty black painting canvas do not overwrite that base. Hidden RGB under transparency is removed before upscaling and input compression. An existing `--base-model` keeps its geometry, UV layout and stored or implicit normals. Use `--base-material TRELLIS.glb` when a separately textured export has the same positions, indices and UVs but omitted those normals; this is validated before painting. The output retains the approved base model’s material settings and maps. The base texture stage also retains the input mesh rather than reconstructing it when attaching its material.
 
 The final asset is always exported cleanly to `<output>/model.glb` (or the specified `.glb` path).
 
@@ -136,7 +136,7 @@ Log in once with `hf auth login` before running. If your input image already has
 | `--texel-density-map` | off | Write a density PNG and TOML occupancy summary after the painted model is complete |
 | `--prompt-file` | prompts/progressive_paint.txt | Path to custom detail repainting prompt |
 | `--paint-base` | `trellis` | Painting input: `trellis` textured render or `normals` render |
-| `--base-material` | none | Optional material from a GLB with identical positions, indices and UVs; requires `--base-model` |
+| `--base-material` | none | Painting/fallback material with matching positions, indices and UVs; output material stays with `--base-model` |
 | `--base-model` | unset | Repaint an existing textured GLB, skipping shape and base-texture generation |
 | `--cameras` | unset | Reuse exact saved camera transforms, lens and image resolution |
 | `--paintings` | unset | Bake a saved directory of camera-named PNG paintings; requires `--cameras` |

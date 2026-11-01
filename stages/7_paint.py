@@ -119,7 +119,7 @@ args.out.parent.mkdir(parents=True, exist_ok=True)
 projected_paintings = paintings
 if args.upscale:
     projected_paintings = progressive / f'gen-upscaled-{args.upscale}x'
-    run_tool('upscale.py', paintings, projected_paintings, '--factor', args.upscale,
+    run_tool('upscale.py', paintings, projected_paintings, '--factor', args.upscale, '--cameras', cameras_path,
              interpreter=os.environ.get('ESPALIER_UPSCALE_PYTHON', os.environ.get('ESPALIER_SHAPE_PYTHON', python)))
 run_tool('bake_paint_views.py', args.base, cameras_path, projected_paintings, bake_directory, args.out, *material_arguments, limit=300)
 if args.texel_density_map:

@@ -34,6 +34,6 @@ packer = Path(__file__).resolve().parents[1] / 'Intermediate/surfaces/pack-gener
 pending = args.output.with_suffix('.pending.glb')
 pending.unlink(missing_ok=True)
 subprocess.run([str(packer), str(args.bake/'sparse-uv.ply'), str(args.bake/'atlas-bc7.ktx'),
-                str(args.bake/'bake-timings.json'), str(pending), str(args.base_material or args.base)], check=True)
+                str(args.bake/'bake-timings.json'), str(pending), str(args.base)], check=True)
 pending.replace(args.output)
 print('BAKED', args.output, flush=True)
