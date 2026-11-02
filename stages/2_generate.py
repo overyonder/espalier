@@ -5,10 +5,12 @@
 """
 import argparse, os, sys, time, torch
 from PIL import Image
+from jobs import run_jobs
 
 p = argparse.ArgumentParser()
-p.add_argument("cutout", help="input cutout PNG")
-p.add_argument("out", help="output field tensor (.pt)")
+p.add_argument("cutout", nargs="?", help="input cutout PNG")
+p.add_argument("out", nargs="?", help="output field tensor (.pt)")
+p.add_argument("--batch", help="tab-separated table of the positional paths, holding models across its rows")
 p.add_argument("--steps", type=int, default=100, help="inference steps (default: 100)")
 p.add_argument("--octree", type=int, default=512, help="octree resolution (default: 512)")
 p.add_argument("--seed", type=int, default=12345, help="sampling seed (default: 12345)")
@@ -77,15 +79,20 @@ class FieldSaved(Exception):
 
 def save_field(latents, **kwargs):
     grid_logits = pipe.vae.volume_decoder(latents, pipe.vae.geo_decoder, **kwargs)
-    torch.save({"latents": latents.cpu(), "grid_logits": grid_logits.cpu(), "kwargs": kwargs}, a.out)
+    torch.save({"latents": latents.cpu(), "grid_logits": grid_logits.cpu(), "kwargs": kwargs}, field_output)
     raise FieldSaved(tuple(grid_logits.shape))
 
 pipe.vae.latents2mesh = save_field
 
-started = time.time()
-try:
-    with Image.open(a.cutout) as image:
-        pipe(image=image.convert("RGBA"), num_inference_steps=a.steps, octree_resolution=a.octree,
-             generator=torch.manual_seed(a.seed), output_type="trimesh")
-except FieldSaved as field:
-    print(f"saved field {field.args[0]} in {time.time() - started:.1f}s -> {a.out}", flush=True)
+def generate_field(cutout, out):
+    global field_output
+    field_output = out
+    started = time.time()
+    try:
+        with Image.open(cutout) as image:
+            pipe(image=image.convert("RGBA"), num_inference_steps=a.steps, octree_resolution=a.octree,
+                 generator=torch.manual_seed(a.seed), output_type="trimesh")
+    except FieldSaved as field:
+        print(f"saved field {field.args[0]} in {time.time() - started:.1f}s -> {out}", flush=True)
+
+run_jobs(a.batch, (a.cutout, a.out), generate_field)

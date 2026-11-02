@@ -6,10 +6,12 @@
 import argparse, os, sys, time
 
 p = argparse.ArgumentParser()
-p.add_argument("field", help="input field tensor (.pt)")
-p.add_argument("out", help="output dense mesh (.ply)")
+p.add_argument("field", nargs="?", help="input field tensor (.pt)")
+p.add_argument("out", nargs="?", help="output dense mesh (.ply)")
+p.add_argument("--batch", help="tab-separated table of the positional paths, holding models across its rows")
 a = p.parse_args()
 
+from jobs import run_jobs
 import torch, trimesh
 from skimage import measure
 from diso import DiffDMC
@@ -38,4 +40,5 @@ def extract(src, out, extractor):
     print(f'dmc {seconds:.1f}s: {len(mesh.vertices)} vertices, {len(mesh.faces)} faces -> {out}', flush=True)
     mesh.export(out)
 
-extract(a.field, a.out, DiffDMC(dtype=torch.float32).cuda())
+extractor = DiffDMC(dtype=torch.float32).cuda()
+run_jobs(a.batch, (a.field, a.out), lambda field, out: extract(field, out, extractor))

@@ -146,6 +146,7 @@ Log in once with `hf auth login` before running. If your input image already has
 | `--paintings` | unset | Bake a saved directory of camera-named PNG paintings; requires `--cameras` |
 | `--painting-output` | unset | Reuse and complete camera-named paintings in this directory; requires `--cameras`; use `--paintings` for a complete read-only set |
 | `--work-dir` | automatic | Separate intermediate directory for this output |
+| `--batch` | unset | Generate base models (stages 1-6) from a table of image and work directory, loading each stage's models once; replaces the positional arguments |
 | `--resume` | off | Reuse completed generation stages and paintings in the output work directory |
 | `--model` | `hybrid` | Pipeline architecture: `hybrid` (Espalier-2.1), `trellis2`, or `pixal3d` |
 

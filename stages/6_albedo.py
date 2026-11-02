@@ -7,12 +7,14 @@ import argparse, os, sys, time
 import numpy as np, torch, trimesh, cv2, flex_gemm, nvdiffrast.torch as dr
 from PIL import Image
 from scipy.spatial import cKDTree
+from jobs import run_jobs
 
 p = argparse.ArgumentParser()
-p.add_argument("cutout", help="input cutout PNG")
-p.add_argument("dense", help="input dense mesh (.ply)")
-p.add_argument("unwrapped", help="input unwrapped model (.glb)")
-p.add_argument("out", help="output base textured model (.glb)")
+p.add_argument("cutout", nargs="?", help="input cutout PNG")
+p.add_argument("dense", nargs="?", help="input dense mesh (.ply)")
+p.add_argument("unwrapped", nargs="?", help="input unwrapped model (.glb)")
+p.add_argument("out", nargs="?", help="output base textured model (.glb)")
+p.add_argument("--batch", help="tab-separated table of the positional paths, holding models across its rows")
 p.add_argument("--texture", type=int, default=4096, help="texture atlas size (default: 4096)")
 p.add_argument("--dinov3", default=None, help="alternative DINOv3 repository")
 a = p.parse_args()
@@ -114,4 +116,8 @@ def generate_texture(image_path, resolution, texture_size, shape_path, unwrapped
     print(f'total {time.time() - started:.1f}s, peak {torch.cuda.max_memory_allocated() / 2 ** 30:.1f} GiB -> {out}', flush=True)
 
 
-generate_texture(a.cutout, 1024, a.texture, a.dense, a.unwrapped, a.out)
+def texture_job(cutout, dense, unwrapped, out):
+    generate_texture(cutout, 1024, a.texture, dense, unwrapped, out)
+    torch.cuda.empty_cache()
+
+run_jobs(a.batch, (a.cutout, a.dense, a.unwrapped, a.out), texture_job)
