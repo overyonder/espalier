@@ -21,7 +21,7 @@ import nvdiffrast.torch as dr
 import torch
 from PIL import Image
 from plyfile import PlyData
-from resident import camera_matrices, run
+from resident import camera_matrices, fit_lens_to_silhouette, run
 from resident_vk import bake
 
 GENERATOR = Path(__file__).resolve().parents[2]
@@ -211,6 +211,8 @@ def fit_cameras(vertices):
             }
         )
     cameras.extend(bottom_cameras(vertices, template))
+    for camera in cameras:
+        fit_lens_to_silhouette(camera, points)
     return {"res": template["res"], "cams": cameras}
 
 

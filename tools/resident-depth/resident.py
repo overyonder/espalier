@@ -19,6 +19,21 @@ import torch
 from PIL import Image
 
 
+# Longest side of the object's projected outline as a fraction of the canvas.
+FRAME_FILL = 0.92
+
+
+def fit_lens_to_silhouette(camera, points):
+    """Fill the canvas from the same viewpoint: lens and shift change, perspective doesn't."""
+    transform = np.array(camera["matrix"])
+    local = (points - transform[:3, 3]) @ transform[:3, :3]
+    projected = local[:, :2] / -local[:, 2:3]
+    low, high = projected.min(0), projected.max(0)
+    focal = 2 * FRAME_FILL / (high - low).max()
+    camera["lens"] = float(focal * camera["sensor"] / 2)
+    camera["shift"] = (-focal * (low + high) / 4).tolist()
+
+
 def camera_matrices(data, device):
     result = []
     for camera in data["cams"]:

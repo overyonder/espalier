@@ -11,7 +11,7 @@ from PIL import Image
 
 sys.path.insert(0, str(Path(__file__).with_name('resident-depth')))
 from batch import fit_cameras
-from resident import camera_matrices
+from resident import camera_matrices, fit_lens_to_silhouette
 
 parser = argparse.ArgumentParser()
 parser.add_argument('mesh', type=Path)
@@ -19,6 +19,7 @@ parser.add_argument('output', type=Path)
 parser.add_argument('cameras', type=Path)
 parser.add_argument('--base', choices=['trellis', 'normals'], default='trellis')
 parser.add_argument('--base-material', type=Path)
+parser.add_argument('--reframe', nargs='+', default=[], help='fit these saved cameras to the silhouette and render them again')
 args = parser.parse_args()
 mesh = load_paint_base(args.mesh, args.base_material)
 vertices = torch.tensor(mesh.vertices, dtype=torch.float32, device='cuda')
@@ -28,6 +29,13 @@ if args.cameras.is_file():
     cameras = json.loads(args.cameras.read_text())
 else:
     cameras = fit_cameras(vertices)
+    args.cameras.write_text(json.dumps(cameras, indent=2))
+if args.reframe:
+    points = world[:, :3].cpu().numpy().astype('f8')
+    for camera in cameras['cams']:
+        if camera['name'] in args.reframe:
+            fit_lens_to_silhouette(camera, points)
+            (args.output / (camera['name'] + '.png')).unlink(missing_ok=True)
     args.cameras.write_text(json.dumps(cameras, indent=2))
 matrices = camera_matrices(cameras, 'cuda')
 if args.base == 'trellis':

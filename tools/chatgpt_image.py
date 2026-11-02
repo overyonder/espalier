@@ -83,10 +83,11 @@ class CodexImageClient:
                     code = detail.get("code") if isinstance(detail, dict) else None
                 except (ValueError, AttributeError):
                     code = None
-                retryable = error.code in (408, 409, 429) or 500 <= error.code <= 599
+                # The endpoint also returns 400 for requests that succeed when repeated.
+                retryable = error.code in (400, 408, 409, 429) or 500 <= error.code <= 599
                 if (not retryable or code in ("insufficient_quota", "organization_usage_limit_exceeded")
                         or attempt == MAX_RETRIES):
-                    raise RuntimeError(f"GPT image request failed: HTTP {error.code}") from None
+                    raise RuntimeError(f"GPT image request failed: HTTP {error.code}: {error_body[:300]!r}") from None
                 value = error.headers.get("Retry-After")
                 if value is not None:
                     try:

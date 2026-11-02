@@ -11,6 +11,8 @@ import sys
 from pathlib import Path
 from PIL import Image
 
+PAINT_ATTEMPTS = 3
+
 parser = argparse.ArgumentParser()
 parser.add_argument('base', type=Path)
 parser.add_argument('reference', type=Path)
@@ -67,7 +69,10 @@ def run_tool(name, *arguments, interpreter=python, environment=None, limit=1800)
     print('DONE', name, flush=True)
 
 material_arguments = ['--base-material', args.base_material] if args.base_material else []
-run_tool('render_paint_views.py', args.base, views, cameras_path, '--base', args.paint_base, *material_arguments, limit=300)
+def render_paint_inputs(*extra):
+    run_tool('render_paint_views.py', args.base, views, cameras_path, '--base', args.paint_base, *material_arguments, *extra, limit=300)
+
+render_paint_inputs()
 cameras = json.loads(cameras_path.read_text())
 if not 1 <= len(cameras['cams']) <= 16:
     parser.error('The resident baker requires between one and sixteen camera views')
@@ -79,7 +84,59 @@ if args.paintings:
 if args.model == 'gpt':
     sys.path.insert(0, str(root/'tools'))
     from chatgpt_image import CodexImageClient
-    client = None
+    from paint_check import measure_painting_against_render
+    # Each view is checked once: a painting that used up its attempts isn't requested again on resume.
+    checks_path = paintings / 'paint-check.json'
+    checks = json.loads(checks_path.read_text()) if checks_path.is_file() else {}
+    attempts_directory = progressive / 'attempts'
+    attempts_directory.mkdir(exist_ok=True)
+
+    def record_painting_check(name, painted, measured, attempts):
+        checks[name] = {**measured, 'attempts': attempts, 'sha256': hashlib.sha256(painted.read_bytes()).hexdigest()}
+        checks_path.write_text(json.dumps(checks, indent=2))
+        print('PAINT_CHECK', name, f"attempts={attempts}", *(f'{k}={v:.3f}' for k, v in measured.items()), flush=True)
+
+    to_paint = []
+    if not args.paintings:
+        for camera in cameras['cams']:
+            name = camera['name']
+            painted = paintings / (name + '.png')
+            if not painted.is_file():
+                to_paint.append(name)
+            elif checks.get(name, {}).get('sha256') != hashlib.sha256(painted.read_bytes()).hexdigest():
+                measured = measure_painting_against_render(views / (name + '.png'), painted)
+                if measured['score'] <= 1:
+                    record_painting_check(name, painted, measured, 0)
+                else:
+                    print('PAINT_REJECTED', name, f"score={measured['score']:.2f}", flush=True)
+                    painted.replace(attempts_directory / (name + '-original.png'))
+                    to_paint.append(name)
+    if to_paint:
+        render_paint_inputs('--reframe', *to_paint)
+        cameras = json.loads(cameras_path.read_text())
+        if args.cameras:
+            # The saved rig stays paired with the paintings it now produces.
+            shutil.copyfile(cameras_path, args.cameras)
+            settings['cameras'] = hashlib.sha256(args.cameras.read_bytes()).hexdigest()
+            settings_path.write_text(json.dumps(settings, indent=2))
+        shutil.rmtree(progressive / 'grade-views', ignore_errors=True)
+        client = CodexImageClient()
+    for name in to_paint:
+        rendered = views / (name + '.png')
+        painted = paintings / (name + '.png')
+        results = []
+        for attempt in range(1, PAINT_ATTEMPTS + 1):
+            candidate = attempts_directory / f'{name}-{attempt}.png'
+            if not candidate.is_file():
+                client.generate(prompt_text, candidate, [rendered, args.reference],
+                                size=f"{cameras['res']}x{cameras['res']}")
+            results.append((measure_painting_against_render(rendered, candidate), candidate))
+            print('PAINT_ATTEMPT', name, attempt, f"score={results[-1][0]['score']:.2f}", flush=True)
+            if results[-1][0]['score'] <= 1:
+                break
+        measured, best = min(results, key=lambda result: result[0]['score'])
+        shutil.copyfile(best, painted)
+        record_painting_check(name, painted, measured, len(results))
 else:
     flux_root = (args.flux_dir or Path(os.environ.get('ESPALIER_FLUX_ROOT', root/'src/flux-3-image-klein'))).resolve()
     flux_python = os.environ.get('ESPALIER_FLUX_PYTHON', str(flux_root/'.venv/bin/python'))
@@ -100,16 +157,9 @@ else:
         run_tool('flux_paint.py', '--batch', jobs, interpreter=flux_python, environment=flux_environment)
 for index, camera in enumerate(cameras['cams']):
     name = camera['name']
-    rendered = views / (name + '.png')
     painted = paintings / (name + '.png')
     if not painted.is_file():
-        if args.paintings:
-            parser.error(f'Missing saved painting: {painted}')
-        if args.model == 'gpt':
-            if client is None:
-                client = CodexImageClient()
-            client.generate(prompt_text, painted, [rendered, args.reference],
-                            size=f"{cameras['res']}x{cameras['res']}")
+        parser.error(f'Missing painting: {painted}')
     with Image.open(painted) as image:
         image.verify()
     with Image.open(painted) as image:
