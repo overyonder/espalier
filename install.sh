@@ -59,7 +59,7 @@ fetch https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git Hunyuan3D-2.1 "$HUNYU
 [ -d "$venv" ] || uv venv --quiet --python 3.10 "$venv"
 uv pip install --python "$venv" torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 uv pip install --python "$venv" setuptools wheel ninja imageio imageio-ffmpeg tqdm easydict opencv-python-headless \
-    trimesh plyfile basicsr==1.4.2 realesrgan==0.3.0 "transformers==4.57.1" pillow kornia timm zstandard diffusers accelerate scikit-image einops omegaconf \
+    trimesh pymeshlab plyfile basicsr==1.4.2 realesrgan==0.3.0 "transformers==4.57.1" pillow kornia timm zstandard diffusers accelerate scikit-image einops omegaconf \
     "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"
 abi=$("$venv/bin/python" -c "import torch; print(str(torch._C._GLIBCXX_USE_CXX11_ABI).upper())")
 uv pip install --python "$venv" "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post2/flash_attn-2.8.3.post2%2Bcu12torch2.8cxx11abi${abi}-cp310-cp310-linux_x86_64.whl"
