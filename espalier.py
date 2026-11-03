@@ -38,6 +38,7 @@ def parse_args():
     p.add_argument("image", nargs="?", help="input image (or views directory for pixal3d)")
     p.add_argument("output", nargs="?", help="output directory or output .glb path")
     p.add_argument("--batch", help="generate base models with each stage's models held across a table of image and work directory")
+    p.add_argument("--batch-through", choices=["unwrap", "texture"], default="texture", help="last stage a --batch run performs")
     p.add_argument("--model", default="hybrid", choices=["hybrid", "trellis2", "pixal3d"],
                    help="hybrid (Hunyuan3D shape + TRELLIS.2 PBR texture, default), trellis2, or pixal3d")
     p.add_argument("--paint", default="flux", choices=["flux", "gpt", "none"],
@@ -136,7 +137,8 @@ def generate_batch(a):
             table.writelines("\t".join(row) + "\n" for row in columns)
             table.flush()
             run_stage(script, "--batch", table.name, *arguments)
-    pending = [p for p in paths if not os.path.isfile(p[6])]
+    final = 5 if a.batch_through == "unwrap" else 6
+    pending = [p for p in paths if not os.path.isfile(p[final])]
     run_batch_stage("1_cutout.py", [(p[0], p[1]) for p in pending])
     # A finished dense mesh needs no field, which is about half a gigabyte.
     run_batch_stage("2_generate.py", [(p[1], p[2]) for p in pending if not os.path.isfile(p[3])],
@@ -147,9 +149,10 @@ def generate_batch(a):
             os.remove(p[2])
     run_batch_stage("4_reduce.py", [(p[3], p[4]) for p in pending], "--faces", str(a.faces))
     run_batch_stage("5_unwrap.py", [(p[4], p[5]) for p in pending])
-    albedo_arguments = ["--texture", str(a.texture)] + (["--dinov3", a.dinov3] if a.dinov3 else [])
-    run_batch_stage("6_albedo.py", [(p[1], p[3], p[5], p[6]) for p in pending], *albedo_arguments)
-    failed = [p[6] for p in paths if not os.path.isfile(p[6])]
+    if final == 6:
+        albedo_arguments = ["--texture", str(a.texture)] + (["--dinov3", a.dinov3] if a.dinov3 else [])
+        run_batch_stage("6_albedo.py", [(p[1], p[3], p[5], p[6]) for p in pending], *albedo_arguments)
+    failed = [p[final] for p in paths if not os.path.isfile(p[final])]
     print(f"BATCH_COMPLETE {len(paths) - len(failed)}/{len(paths)}", *failed, flush=True)
 
 
