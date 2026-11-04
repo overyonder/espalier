@@ -3,7 +3,7 @@
 # Transparent background. blender -b --python render/render_views.py -- <mesh.glb|mesh.ply> <out prefix> [yaw degrees] [up axis]
 # VIEWS="az:el,..." renders those views instead, framing the bounding sphere's diameter in FILL of the frame so tilted
 # views aren't cropped (project.py frames an azimuth:elevation view the same way).
-# The yaw turns a model whose export faces another way (Pixal3D and TRELLIS.2 face glTF -Z) to the shared front. A PLY
+# The yaw turns a model whose export faces another way (TRELLIS.2 faces glTF -Z) to the shared front. A PLY
 # is imported natively, without glTF's axis conversion, so a Y-up PLY (Hunyuan's) passes up axis y to stand it up.
 import bpy, sys, math, mathutils, os
 args = sys.argv[sys.argv.index('--') + 1:]; mesh_path, prefix = args[:2]; yaw = float(args[2]) if len(args) > 2 else 0.0

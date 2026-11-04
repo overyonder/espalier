@@ -1,23 +1,20 @@
 #!/usr/bin/env bash
 # Builds over|yonder Espalier-2.1: Tencent's Hunyuan3D-2.1 shape generation, Microsoft's TRELLIS.2 PBR texturing and
 # progressive projection painting on a 16 GB consumer GPU, with CuMesh and FlexGEMM extensions at pinned commits.
-# With --pixal3d it also installs Tencent's Pixal3D into the same environment.
 #
 # Needs: an NVIDIA driver, the CUDA toolkit 12.8 or later (CUDA_HOME, or nvcc on PATH), a GCC that toolkit supports,
-# git and uv, and for --pixal3d also cmake and make. TORCH_CUDA_ARCH_LIST defaults to the installed GPU's compute
+# git and uv. TORCH_CUDA_ARCH_LIST defaults to the installed GPU's compute
 # capability.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 src=$here/src
 venv=$here/.venv
 mkdir -p "$src"
-pixal3d=0
 flux=0
 for arg in "$@"; do
     case $arg in
-        --pixal3d) pixal3d=1 ;;
         --flux) flux=1 ;;
-        *) echo "usage: $0 [--pixal3d] [--flux]"; exit 1 ;;
+        *) echo "usage: $0 [--flux]"; exit 1 ;;
     esac
 done
 
@@ -29,10 +26,6 @@ NVDIFFREC_COMMIT=b296927
 HUNYUAN3D21_COMMIT=82920d643c0dc2f7bfd7255f45f62d386edfe60c
 HI3D_COMMIT=13657ad09afaa92e350b461a1cd66399e44a59c4
 FLUX_COMMIT=66c403598c1d5300d0246a4e32049e29a39f60fe
-PIXAL3D_COMMIT=f7cf38429b0bd264f1995f0f8743a88b1c728b94
-# Pixal3D's requirements take MoGe from its default branch, whose current version conflicts with their trimesh pin; this
-# is the commit that was current on the requirements' date, 19 May 2026.
-MOGE_COMMIT=07444410f1e33f402353b99d6ccd26bd31e469e8
 
 export CUDA_HOME=${CUDA_HOME:-$(dirname "$(dirname "$(command -v nvcc)")")}
 export PATH=$CUDA_HOME/bin:$PATH
@@ -117,26 +110,6 @@ if [ $flux = 1 ]; then
     [ -d "$flux_venv" ] || uv venv --python 3.12 "$flux_venv"
     uv pip install --python "$flux_venv/bin/python" -e "$src/flux-3-image-klein[nvfp4]" \
         --extra-index-url https://download.pytorch.org/whl/cu130 --extra-index-url https://flashinfer.ai/whl/cu130
-fi
-if [ $pixal3d = 1 ]; then
-    # Pixal3D's README steps 2 to 4 on the TRELLIS.2 base above. Its gradio requirement is only for its web demo.
-    fetch https://github.com/TencentARC/Pixal3D.git Pixal3D "$PIXAL3D_COMMIT" pixal3d.patch
-    grep -v -e '^git+https://github.com/microsoft/MoGe' -e '^gradio' "$src/Pixal3D/requirements.txt" > "$src/pixal3d-requirements.txt"
-    uv pip install --python "$venv" -r "$src/pixal3d-requirements.txt" "git+https://github.com/microsoft/MoGe.git@$MOGE_COMMIT"
-    # MoGe depends on OpenCV's GUI build, which replaces the headless cv2 and needs libGL; reinstalling the headless build
-    # puts it back, and MoGe uses nothing the headless build lacks
-    uv pip install --python "$venv" --reinstall-package opencv-python-headless \
-        "$(grep '^opencv-python-headless' "$src/pixal3d-requirements.txt")"
-    CUDACXX=$CUDA_HOME/bin/nvcc CPATH=$CUDA_HOME/include${CPATH:+:$CPATH} NATTEN_CUDA_ARCH=$TORCH_CUDA_ARCH_LIST \
-        NATTEN_N_WORKERS=$MAX_JOBS uv pip install --python "$venv" --no-build-isolation natten==0.21.0
-    # Pixal3D's own build of utils3d, which MoGe's camera estimation uses; TRELLIS.2's inference doesn't import utils3d
-    uv pip install --python "$venv" https://github.com/LDYang694/Storages/releases/download/20260430/utils3d-0.0.2-py3-none-any.whl
-    for marker in stream_weights_from_file:models/__init__.py TRELLIS_DECODE_TILE_SPLIT:models/sc_vaes/sparse_unet_vae.py \
-            NAF_TILE:trainers/flow_matching/mixins/image_conditioned_proj.py sample_index:trainers/flow_matching/mixins/image_conditioned_proj.py \
-            "tex_slat = None":pipelines/pixal3d_image_to_3d.py; do
-        grep -q "${marker%%:*}" "$src/Pixal3D/pixal3d/${marker#*:}" || { echo "Pixal3D is missing Espalier-2's patch"; exit 1; }
-    done
-    "$venv/bin/python" -c "import natten, moge, utils3d; utils3d.pt.depth_map_to_point_map" || { echo "Pixal3D's dependencies didn't install"; exit 1; }
 fi
 uv pip check --python "$venv"
 "$here/tools/build-native.sh"

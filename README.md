@@ -151,7 +151,7 @@ Log in once with `hf auth login` before running. If your input image already has
 | `--work-dir` | automatic | Separate intermediate directory for this output |
 | `--batch` | unset | Generate base models (stages 1-7) from a table of image and work directory, loading each stage's models once; replaces the positional arguments |
 | `--resume` | off | Reuse completed generation stages and paintings in the output work directory |
-| `--model` | `hybrid` | Pipeline architecture: `hybrid` (Espalier-2.1), `trellis2`, or `pixal3d` |
+| `--model` | `hybrid` | Pipeline architecture: `hybrid` (Espalier-2.1) or `trellis2` |
 
 Every stage runs in `.venv`, FLUX aside. `ESPALIER_REFINE_MODEL` names a local weights directory for offline use. `stages/4_refine.py --phase` runs one phase at a time, so that each can hold its own GPU reservation. Existing installations can be reused through `ESPALIER_SHAPE_ROOT`, `ESPALIER_TRELLIS_ROOT` and `ESPALIER_FLUX_ROOT`. Set `ESPALIER_SHAPE_PYTHON`, `ESPALIER_TEXTURE_PYTHON` and `ESPALIER_FLUX_PYTHON` to their environment interpreters. Upscaling uses `ESPALIER_UPSCALE_PYTHON`, falling back to the shape interpreter and then the texture interpreter. Its environment needs BasicSR 1.4.2 and Real-ESRGAN 0.3.0. The default roots are the corresponding checkouts under `src/`; shape and texture stages otherwise use Espalier's environment.
 
@@ -164,5 +164,5 @@ On NixOS, source `tools/nixos-environment.sh` once before a CLI run or batch.
 ## Licence
 
 Espalier-2.1 is licensed under MIT-SLOP, MIT with an automated-use condition; see [LICENSE](LICENSE).
-TRELLIS.2, its weights, CuMesh, FlexGEMM, Hunyuan3D-2.1, Pixal3D, MoGe, and NATTEN are MIT licensed.
+TRELLIS.2, its weights, CuMesh, FlexGEMM, and Hunyuan3D-2.1 are MIT licensed.
 DINOv3 and RMBG-2.0 have their own respective upstream licences.

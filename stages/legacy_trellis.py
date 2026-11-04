@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Legacy Espalier-2 pipeline: pure TRELLIS.2 and Pixal3D single-image/multi-view generation and export.
+"""Legacy Espalier-2 pipeline: pure TRELLIS.2 generation and export.
 
-  python3 stages/legacy_trellis.py <image> <output_dir> [--model trellis2|pixal3d] [--stage generate|export]
+  python3 stages/legacy_trellis.py <image> <output_dir> [--stage generate|export]
 """
-import argparse, json, math, os, subprocess, sys, time
+import argparse, json, os, sys, time
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(here, "src", "TRELLIS.2"))
 os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
-PIXAL3D_ROTATION = [[-1, 0, 0, 0], [0, 0, -1, 0], [0, -1, 0, 0], [0, 0, 0, 1]]
-
 p = argparse.ArgumentParser()
 p.add_argument("image")
 p.add_argument("output")
-p.add_argument("--model", default="trellis2", choices=["trellis2", "pixal3d"])
 p.add_argument("--pipeline", default="1536_cascade", choices=["512", "1024", "1024_cascade", "1536_cascade"])
 p.add_argument("--seed", type=int, default=42)
 p.add_argument("--tile", type=int, default=None)
@@ -23,15 +20,33 @@ p.add_argument("--max-tokens", type=int, default=49152)
 p.add_argument("--texture", type=int, default=4096)
 p.add_argument("--faces", type=int, default=1000000)
 p.add_argument("--no-texture", action="store_true")
-p.add_argument("--fov", type=float, default=None)
 p.add_argument("--no-rembg", action="store_true")
 p.add_argument("--dinov3", default=None)
 p.add_argument("--stage", choices=["generate", "export"], required=True)
 a = p.parse_args()
 
 
+def no_rembg(module):
+    """Replaces RMBG-2.0 with a stub, so it's never downloaded; images then need an alpha channel."""
+    class NoRembg:
+        def __init__(self, *x, **k): pass
+        def to(self, *x, **k): return self
+        def cuda(self): return self
+        def cpu(self): return self
+        def __call__(self, *x, **k): raise RuntimeError("--no-rembg needs images with an alpha channel")
+    module.BiRefNet = NoRembg
+
+
 def run_trellis2():
     from PIL import Image
+    if a.dinov3:
+        import trellis2.modules.image_feature_extractor as fe
+        load = fe.DINOv3ViTModel.from_pretrained
+        fe.DINOv3ViTModel.from_pretrained = lambda name, *x, **k: load(
+            a.dinov3 if name == "facebook/dinov3-vitl16-pretrain-lvd1689m" else name, *x, **k)
+    if a.no_rembg:
+        import trellis2.pipelines.rembg
+        no_rembg(trellis2.pipelines.rembg)
     from trellis2.pipelines import Trellis2ImageTo3DPipeline
     pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
     pipeline.cuda()
@@ -52,19 +67,19 @@ def generate():
     import torch
     os.makedirs(a.output, exist_ok=True)
     mesh, res, t0, extra = run_trellis2()
-    raw = {"vertices": mesh.vertices.cpu(), "faces": mesh.faces.cpu(), "resolution": res, "rotation": None}
+    raw = {"vertices": mesh.vertices.cpu(), "faces": mesh.faces.cpu(), "resolution": res}
     if not a.no_texture:
         raw.update(coords=mesh.coords.cpu(), attrs=mesh.attrs.cpu())
     torch.save(raw, os.path.join(a.output, "raw.pt"))
-    info = {"model": a.model, "pipeline": a.pipeline, "texture": not a.no_texture, "seed": a.seed, "tile": tile,
-            "resolution": res, "vertices": len(mesh.vertices), "faces": len(mesh.faces),
+    info = {"model": "trellis2", "pipeline": a.pipeline, "texture": not a.no_texture, "seed": a.seed, "tile": tile,
+            "max_tokens": a.max_tokens, **extra, "resolution": res, "vertices": len(mesh.vertices), "faces": len(mesh.faces),
             "seconds": round(time.time() - t0, 1)}
     json.dump(info, open(os.path.join(a.output, "generate.json"), "w"), indent=1)
     print("generated", info, flush=True)
 
 
 def export():
-    import numpy as np, torch, cumesh, o_voxel
+    import torch, cumesh, o_voxel
     r = torch.load(os.path.join(a.output, "raw.pt"))
     t0 = time.time()
     m = cumesh.CuMesh()

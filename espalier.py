@@ -4,7 +4,7 @@
 Master CLI orchestrator directing each stage in an isolated process to ensure complete
 GPU memory reclamation between model steps.
 
-  espalier <image> <output directory or out.glb> [--model hybrid|trellis2|pixal3d]
+  espalier <image> <output directory or out.glb> [--model hybrid|trellis2]
            [--paint flux|gpt|none] [--gpt-image] [--faces 56000] [--texture 4096]
            [--steps 100] [--octree 512] [--seed 12345] [--no-rembg]
 
@@ -36,12 +36,12 @@ def parse_args():
         description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    p.add_argument("image", nargs="?", help="input image (or views directory for pixal3d)")
+    p.add_argument("image", nargs="?", help="input image")
     p.add_argument("output", nargs="?", help="output directory or output .glb path")
     p.add_argument("--batch", help="generate base models with each stage's models held across a table of image and work directory")
     p.add_argument("--batch-through", choices=["unwrap", "texture"], default="texture", help="last stage a --batch run performs")
-    p.add_argument("--model", default="hybrid", choices=["hybrid", "trellis2", "pixal3d"],
-                   help="hybrid (Hunyuan3D shape + TRELLIS.2 PBR texture, default), trellis2, or pixal3d")
+    p.add_argument("--model", default="hybrid", choices=["hybrid", "trellis2"],
+                   help="hybrid (Hunyuan3D shape + TRELLIS.2 PBR texture, default) or trellis2")
     p.add_argument("--paint", default="flux", choices=["flux", "gpt", "none"],
                    help="detail pass: 'flux' (FLUX.3 [klein] offline painting, default), 'gpt' (Codex endpoint), or 'none'")
     p.add_argument("--gpt-image", action="store_true", help="shortcut for --paint gpt")
@@ -75,7 +75,6 @@ def parse_args():
     p.add_argument("--tile", type=int, default=None)
     p.add_argument("--max-tokens", type=int, default=49152)
     p.add_argument("--no-texture", action="store_true")
-    p.add_argument("--fov", type=float, default=None)
 
     a = p.parse_args()
     if a.faces is None:
@@ -91,10 +90,6 @@ def parse_args():
     if a.gpt_image:
         a.paint = "gpt"
 
-    if a.model == "pixal3d" and a.pipeline not in ("1024_cascade", "1536_cascade"):
-        p.error("Pixal3D has only the 1024_cascade and 1536_cascade pipelines")
-    if os.path.isdir(a.image) and a.model != "pixal3d":
-        p.error("a views directory needs --model pixal3d")
     if a.prompt_file and not os.path.isfile(a.prompt_file):
         p.error(f"Prompt file does not exist: {a.prompt_file}")
     if (a.paintings or a.painting_output) and not a.cameras:
@@ -265,9 +260,10 @@ def main():
     else:
         # Legacy Espalier-2 models
         for st in ("generate", "export"):
-            legacy_args = [a.image, out_dir, "--model", a.model, "--pipeline", a.pipeline,
+            legacy_args = [a.image, out_dir, "--pipeline", a.pipeline,
                            "--seed", str(a.seed), "--texture", str(a.texture),
                            "--faces", str(a.faces), "--stage", st]
+            legacy_args.extend(["--max-tokens", str(a.max_tokens)])
             if a.tile is not None:
                 legacy_args.extend(["--tile", str(a.tile)])
             if a.no_texture:
