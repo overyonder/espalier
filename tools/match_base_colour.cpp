@@ -1,5 +1,5 @@
 // Match a fallback atlas to foreground colour statistics in aligned painted
-// views.
+// views, or in one transparent-background reference image.
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -52,17 +52,32 @@ int main(int argc, char **argv) {
   try {
     if (argc != 7)
       throw std::runtime_error("Usage: match-base-colour BASE.png CAMERAS.json "
-                               "RENDERS PAINTINGS OUTPUT.png REPORT.toml");
+                               "RENDERS PAINTINGS|REFERENCE.png OUTPUT.png "
+                               "REPORT.toml");
     std::ifstream input(argv[2]);
     const auto cameras = nlohmann::json::parse(input).at("cams");
     if (cameras.empty())
       throw std::runtime_error("No calibration views");
     Moments source, target;
     unsigned used_views = 0;
+    const bool to_reference = std::filesystem::is_regular_file(argv[4]);
+    if (to_reference) {
+      const auto reference = load(argv[4]);
+      bool transparent = false;
+      for (size_t i = 0; i < reference.rgba.size(); i += 4) {
+        transparent |= reference.rgba[i + 3] < 128;
+        if (foreground(&reference.rgba[i]))
+          target.add(&reference.rgba[i], 1);
+      }
+      if (!transparent)
+        throw std::runtime_error("The reference needs a transparent background");
+    }
     for (const auto &camera : cameras) {
       const auto name = camera.at("name").get<std::string>() + ".png";
       const auto rendered = load(std::filesystem::path(argv[3]) / name);
-      const auto painted = load(std::filesystem::path(argv[4]) / name);
+      const auto painted = to_reference
+                               ? Image{}
+                               : load(std::filesystem::path(argv[4]) / name);
       // Equal camera weighting, using corresponding foreground samples on both
       // canvases.
       constexpr unsigned grid = 256;
@@ -74,10 +89,13 @@ int main(int argc, char **argv) {
                        rendered.width +
                    (2 * x + 1) * rendered.width / (2 * grid));
           const size_t b =
-              4 * (size_t((2 * y + 1) * painted.height / (2 * grid)) *
-                       painted.width +
-                   (2 * x + 1) * painted.width / (2 * grid));
-          if (foreground(&rendered.rgba[a]) && foreground(&painted.rgba[b]))
+              to_reference
+                  ? 0
+                  : 4 * (size_t((2 * y + 1) * painted.height / (2 * grid)) *
+                             painted.width +
+                         (2 * x + 1) * painted.width / (2 * grid));
+          if (foreground(&rendered.rgba[a]) &&
+              (to_reference || foreground(&painted.rgba[b])))
             pairs.push_back({a, b});
         }
       if (pairs.size() < 64)
@@ -86,10 +104,11 @@ int main(int argc, char **argv) {
       const double weight = 1. / pairs.size();
       for (const auto pair : pairs) {
         source.add(&rendered.rgba[pair[0]], weight);
-        target.add(&painted.rgba[pair[1]], weight);
+        if (!to_reference)
+          target.add(&painted.rgba[pair[1]], weight);
       }
     }
-    if (!used_views)
+    if (!used_views || !target.weight)
       throw std::runtime_error(
           "No overlapping painted foreground for colour matching");
     std::array<double, 3> gain{}, offset{};

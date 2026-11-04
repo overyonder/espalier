@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 5: UV Unwrap. Generates non-overlapping UV atlas layout using xatlas through CuMesh.
+"""Stage 6: UV Unwrap. Generates non-overlapping UV atlas layout using xatlas through CuMesh.
 
-  python3 stages/5_unwrap.py <reduced.ply> <out_unwrapped.glb>
+  python3 stages/6_unwrap.py <reduced.ply> <out_unwrapped.glb>
 """
 import argparse, os, sys, time, torch, numpy as np, trimesh, cumesh
 from jobs import run_jobs
@@ -12,7 +12,7 @@ p.add_argument("out", nargs="?", help="output unwrapped model (.glb)")
 p.add_argument("--batch", help="tab-separated table of the positional paths, holding models across its rows")
 a = p.parse_args()
 
-print("== 5 unwrap UVs (xatlas)", flush=True)
+print("== 6 unwrap UVs (xatlas)", flush=True)
 def unwrap(reduced_path, out):
     started = time.time()
     m = trimesh.load(reduced_path, process=False, force="mesh")

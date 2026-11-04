@@ -5,4 +5,5 @@ export LD_LIBRARY_PATH="/run/opengl-driver/lib:$espalier_libraries${LD_LIBRARY_P
 export LIBRARY_PATH="/run/opengl-driver/lib${LIBRARY_PATH:+:$LIBRARY_PATH}" TRITON_LIBCUDA_PATH=/run/opengl-driver/lib
 export PATH="$espalier_compiler/bin:$PATH" CC="$espalier_compiler/bin/gcc" CXX="$espalier_compiler/bin/g++"
 export SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+export VK_DRIVER_FILES=/run/opengl-driver/share/vulkan/icd.d/nvidia_icd.json
 unset espalier_libraries espalier_compiler

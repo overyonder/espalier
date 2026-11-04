@@ -29,13 +29,16 @@ parser.add_argument('--cameras', type=Path)
 parser.add_argument('--paintings', type=Path)
 parser.add_argument('--base-material', type=Path)
 parser.add_argument('--no-base-colour-match', action='store_true')
+parser.add_argument('--colour-reference', type=Path, help='transparent-background image the base is matched to before painting (default: the reference)')
 parser.add_argument('--painting-output', type=Path)
+parser.add_argument('--phase', choices=['all', 'render', 'paint', 'bake'], default='all',
+                    help='render needs the GPU, paint waits on the network, bake needs the GPU; each can hold its own reservation')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[1]
 density_tool = root / 'Intermediate/surfaces/atlas-density'
 if args.texel_density_map and not density_tool.is_file():
     parser.error('Build the native density tool with tools/build-native.sh first')
-python = os.environ.get('ESPALIER_TEXTURE_PYTHON', sys.executable)
+python = sys.executable
 progressive = args.work / 'progressive' / args.paint_base
 views = progressive / 'views'
 paintings = args.paintings or args.painting_output or progressive / 'gen'
@@ -53,6 +56,9 @@ settings = {'base': hashlib.sha256(args.base.read_bytes()).hexdigest(),
             'paintings': str(paintings.resolve())}
 if args.base_material:
     settings['base_material'] = hashlib.sha256(args.base_material.read_bytes()).hexdigest()
+match_base_to_reference = args.paint_base == 'trellis' and not args.no_base_colour_match and not args.paintings
+if match_base_to_reference:
+    settings['base_matched_to_reference'] = True
 settings_path = progressive / 'settings.json'
 if settings_path.is_file() and json.loads(settings_path.read_text()) != settings:
     parser.error('Painting inputs changed; choose a new output directory to preserve existing views')
@@ -69,10 +75,22 @@ def run_tool(name, *arguments, interpreter=python, environment=None, limit=1800)
     print('DONE', name, flush=True)
 
 material_arguments = ['--base-material', args.base_material] if args.base_material else []
+reference_matched_base = progressive / 'base-reference-matched.png'
+base_colour_arguments = ['--base-colour', reference_matched_base] if match_base_to_reference else []
 def render_paint_inputs(*extra):
-    run_tool('render_paint_views.py', args.base, views, cameras_path, '--base', args.paint_base, *material_arguments, *extra, limit=300)
+    run_tool('render_paint_views.py', args.base, views, cameras_path, '--base', args.paint_base, *material_arguments, *base_colour_arguments, *extra, limit=300)
 
-render_paint_inputs()
+# The painter receives the base already matched to the reference, so it adds detail rather than correcting colour.
+if match_base_to_reference and args.phase != 'paint' and not reference_matched_base.is_file():
+    unmatched_views = progressive / 'views-unmatched'
+    original_base = progressive / 'base-original.png'
+    run_tool('render_paint_views.py', args.base, unmatched_views, cameras_path, '--base', args.paint_base, *material_arguments,
+             '--save-base-colour', original_base, limit=300)
+    subprocess.run([str(root / 'Intermediate/surfaces/match-base-colour'), str(original_base), str(cameras_path), str(unmatched_views),
+                    str(args.colour_reference or args.reference), str(reference_matched_base), str(progressive / 'base-reference-match.toml')], check=True)
+
+if args.phase != 'paint':
+    render_paint_inputs()
 cameras = json.loads(cameras_path.read_text())
 if not 1 <= len(cameras['cams']) <= 16:
     parser.error('The resident baker requires between one and sixteen camera views')
@@ -109,9 +127,9 @@ if args.model == 'gpt':
                     record_painting_check(name, painted, measured, 0)
                 else:
                     print('PAINT_REJECTED', name, f"score={measured['score']:.2f}", flush=True)
-                    painted.replace(attempts_directory / (name + '-original.png'))
+                    painted.unlink()
                     to_paint.append(name)
-    if to_paint:
+    if to_paint and args.phase in ('all', 'render'):
         render_paint_inputs('--reframe', *to_paint)
         cameras = json.loads(cameras_path.read_text())
         if args.cameras:
@@ -120,7 +138,9 @@ if args.model == 'gpt':
             settings['cameras'] = hashlib.sha256(args.cameras.read_bytes()).hexdigest()
             settings_path.write_text(json.dumps(settings, indent=2))
         shutil.rmtree(progressive / 'grade-views', ignore_errors=True)
-        client = CodexImageClient()
+    if args.phase == 'render':
+        sys.exit()
+    client = CodexImageClient() if to_paint else None
     for name in to_paint:
         rendered = views / (name + '.png')
         painted = paintings / (name + '.png')
@@ -136,6 +156,8 @@ if args.model == 'gpt':
                 break
         measured, best = min(results, key=lambda result: result[0]['score'])
         shutil.copyfile(best, painted)
+        for _, candidate in results:
+            candidate.unlink()
         record_painting_check(name, painted, measured, len(results))
 else:
     flux_root = (args.flux_dir or Path(os.environ.get('ESPALIER_FLUX_ROOT', root/'src/flux-3-image-klein'))).resolve()
@@ -155,6 +177,8 @@ else:
         run_tool('flux_upsample.py', '--batch', progressive/'prompt.txt', jobs,
                  interpreter=flux_python, environment=flux_environment)
         run_tool('flux_paint.py', '--batch', jobs, interpreter=flux_python, environment=flux_environment)
+if args.phase == 'paint':
+    sys.exit()
 for index, camera in enumerate(cameras['cams']):
     name = camera['name']
     painted = paintings / (name + '.png')
@@ -170,15 +194,14 @@ args.out.parent.mkdir(parents=True, exist_ok=True)
 projected_paintings = paintings
 if args.upscale:
     projected_paintings = progressive / f'gen-upscaled-{args.upscale}x'
-    run_tool('upscale.py', paintings, projected_paintings, '--factor', args.upscale, '--cameras', cameras_path,
-             interpreter=os.environ.get('ESPALIER_UPSCALE_PYTHON', os.environ.get('ESPALIER_SHAPE_PYTHON', python)))
+    run_tool('upscale.py', paintings, projected_paintings, '--factor', args.upscale, '--cameras', cameras_path,)
 grade_arguments = []
 if not args.no_base_colour_match:
     grade_views = views if args.paint_base == 'trellis' else progressive / 'grade-views'
     if args.paint_base != 'trellis':
         run_tool('render_paint_views.py', args.base, grade_views, cameras_path, '--base', 'trellis', *material_arguments, limit=300)
     grade_arguments = ['--colour-match-views', grade_views]
-run_tool('bake_paint_views.py', args.base, cameras_path, projected_paintings, bake_directory, args.out, *material_arguments, *grade_arguments, limit=300)
+run_tool('bake_paint_views.py', args.base, cameras_path, projected_paintings, bake_directory, args.out, *material_arguments, *base_colour_arguments, *grade_arguments, limit=300)
 if args.texel_density_map:
     print('START texel density map', flush=True)
     prefix = args.out.with_name(args.out.stem + '-texel-density')

@@ -21,11 +21,15 @@ parser.add_argument('paintings', type=Path)
 parser.add_argument('bake', type=Path)
 parser.add_argument('output', type=Path)
 parser.add_argument('--base-material', type=Path)
+parser.add_argument('--base-colour', type=Path)
 parser.add_argument('--colour-match-views', type=Path)
 args = parser.parse_args()
 cameras = json.loads(args.cameras.read_text())
 vertices, normals, uv, faces, flat = load_geometry(args.base, True)
 base_colour = load_paint_base(args.base, args.base_material).visual.material.baseColorTexture
+if args.base_colour:
+    with Image.open(args.base_colour) as image:
+        base_colour = image.copy()
 future = Future()
 future.set_result((vertices, normals, uv, faces))
 args.bake.mkdir(parents=True, exist_ok=True)

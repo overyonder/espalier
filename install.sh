@@ -27,6 +27,7 @@ FLEXGEMM_COMMIT=6dd94a8
 NVDIFFRAST_TAG=v0.4.0
 NVDIFFREC_COMMIT=b296927
 HUNYUAN3D21_COMMIT=82920d643c0dc2f7bfd7255f45f62d386edfe60c
+HI3D_COMMIT=13657ad09afaa92e350b461a1cd66399e44a59c4
 FLUX_COMMIT=66c403598c1d5300d0246a4e32049e29a39f60fe
 PIXAL3D_COMMIT=f7cf38429b0bd264f1995f0f8743a88b1c728b94
 # Pixal3D's requirements take MoGe from its default branch, whose current version conflicts with their trimesh pin; this
@@ -53,24 +54,45 @@ fetch https://github.com/JeffreyXiang/FlexGEMM.git FlexGEMM "$FLEXGEMM_COMMIT"
 fetch https://github.com/NVlabs/nvdiffrast.git nvdiffrast "$NVDIFFRAST_TAG"
 fetch https://github.com/JeffreyXiang/nvdiffrec.git nvdiffrec "$NVDIFFREC_COMMIT"
 fetch https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1.git Hunyuan3D-2.1 "$HUNYUAN3D21_COMMIT"
+fetch https://github.com/hi3d-official/Hi3Dv1.0.git Hi3Dv1.0 "$HI3D_COMMIT"
 
 # PyTorch 2.8 with CUDA 12.8 and flash-attn 2.8.3 are the oldest builds with Blackwell (sm_120) kernels; Microsoft's
 # setup pins PyTorch 2.6 with CUDA 12.4 and flash-attn 2.7.3. transformers stays below 5, which this code predates.
+# Change this environment here: a separate uv pip install doesn't see the transformers pin, and diffusers alone takes
+# huggingface-hub 1, which transformers 4 refuses at import.
 [ -d "$venv" ] || uv venv --quiet --python 3.10 "$venv"
 uv pip install --python "$venv" torch==2.8.0 torchvision==0.23.0 --index-url https://download.pytorch.org/whl/cu128
 uv pip install --python "$venv" setuptools wheel ninja imageio imageio-ffmpeg tqdm easydict opencv-python-headless \
-    trimesh pymeshlab plyfile basicsr==1.4.2 realesrgan==0.3.0 "transformers==4.57.1" pillow kornia timm zstandard diffusers accelerate scikit-image einops omegaconf \
+    "numpy<2" "trimesh<5" "opencv-python<4.13" "opencv-python-headless<4.13" pymeshlab "plyfile<1.1" basicsr==1.4.2 realesrgan==0.3.0 "transformers==4.57.1" pillow kornia timm zstandard diffusers accelerate scikit-image einops omegaconf \
+    pyfqmr spconv-cu126==2.3.8 \
     "git+https://github.com/EasternJournalist/utils3d.git@9a4eb15e4021b67b12c460c7057d642626897ec8"
 abi=$("$venv/bin/python" -c "import torch; print(str(torch._C._GLIBCXX_USE_CXX11_ABI).upper())")
 uv pip install --python "$venv" "https://github.com/Dao-AILab/flash-attention/releases/download/v2.8.3.post2/flash_attn-2.8.3.post2%2Bcu12torch2.8cxx11abi${abi}-cp310-cp310-linux_x86_64.whl"
 
 # --no-cache --reinstall so the patched sources are always compiled, never a cached build of the originals, and
-# --no-deps because o-voxel lists CuMesh and FlexGEMM as unpinned git dependencies that would replace the builds above
+# --no-deps because o-voxel lists CuMesh and FlexGEMM as unpinned git dependencies that would replace the builds above.
+# One build at a time, because each already compiles on MAX_JOBS.
+extensions=()
 for ext in nvdiffrast:nvdiffrast nvdiffrec:nvdiffrec-render CuMesh:cumesh FlexGEMM:flex-gemm TRELLIS.2/o-voxel:o-voxel; do
-    dir=${ext%%:*} package=${ext#*:}
-    echo "building $dir"
-    uv pip install --python "$venv" --no-build-isolation --no-cache --no-deps --reinstall-package "$package" "$src/$dir"
+    extensions+=("$src/${ext%%:*}" --reinstall-package "${ext#*:}")
 done
+UV_CONCURRENT_BUILDS=1 uv pip install --python "$venv" --no-build-isolation --no-cache --no-deps "${extensions[@]}"
+
+[ -f "$src/Hunyuan3D-2.1/hy3dpaint/ckpt/RealESRGAN_x4plus.pth" ] || curl -L --create-dirs -o "$src/Hunyuan3D-2.1/hy3dpaint/ckpt/RealESRGAN_x4plus.pth" \
+    https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth
+uv pip install --python "$venv" --no-deps -e "$src/Hi3Dv1.0"
+# Hi3D refuses a repository holding anything but its own files, and a Hugging Face snapshot also holds .gitattributes.
+"$venv/bin/python" - "$src/Hi3Dv1.0/weights" <<'HI3D_WEIGHTS'
+import os, sys
+from huggingface_hub import hf_hub_download
+root = sys.argv[1]
+files = ["model_index.json", "scheduler/scheduler_config.json"] + [f"{part}/{name}" for part in ("vae", "transformer_512", "transformer_1024") for name in ("config.json", "model.safetensors")]
+for name in files:
+    path = os.path.join(root, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if not os.path.lexists(path):
+        os.symlink(hf_hub_download("hi3d-official/Hi3Dv1.0", name), path)
+HI3D_WEIGHTS
 
 # Dual Marching Cubes (diso) for GPU surface extraction
 if ! "$venv/bin/python" -c "import diso" 2>/dev/null; then
@@ -116,5 +138,6 @@ if [ $pixal3d = 1 ]; then
     done
     "$venv/bin/python" -c "import natten, moge, utils3d; utils3d.pt.depth_map_to_point_map" || { echo "Pixal3D's dependencies didn't install"; exit 1; }
 fi
+uv pip check --python "$venv"
 "$here/tools/build-native.sh"
 echo "Espalier-2.1 is installed. Run: $here/espalier <image> <output directory>"

@@ -9,10 +9,11 @@ surface appearance and multi-view projection painting:
 
 1. **Precision Neural Shape**: Tencent's [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) generates a watertight 3D occupancy field at 100 flow matching steps and octree resolution 512.
 2. **Dense Surface Extraction**: GPU Dual Marching Cubes (DMC via `diso`) extracts the manifold triangular surface.
-3. **Decimation & Repair**: CuMesh cleans duplicate geometry, fills holes, and decimates the dense mesh to a production-ready 56,000 face budget.
-4. **UV Unwrapping**: CuMesh and xatlas parameterize and pack clean UV charts into a standard 0–1 texture atlas.
-5. **Base PBR Albedo**: Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) is repurposed as a shape-conditioned voxel texturing engine, baking base color, roughness, and metallic into a 4096×4096 atlas without seams.
-6. **15-Camera Resident GPU Projection Painting**: Eight orbit views at 15°, four elevated views at 50°, and three underside views at -50° cover the model. GPU rendering and projection share the exact saved cameras. Each view is repainted against the reference, then all views are projected onto the 4096 atlas by the resident Vulkan baker with cosine-to-the-tenth weighting and BC7 encoding. The mesh, UVs and base PBR material are preserved.
+3. **Refinement**: [Hi3D v1.0](https://github.com/hi3d-official/Hi3Dv1.0) refines the dense surface against the reference image at a 1024 sparse grid.
+4. **Decimation & Repair**: CuMesh cleans duplicate geometry, fills holes, and decimates the refined mesh to a production-ready 56,000 face budget.
+5. **UV Unwrapping**: CuMesh and xatlas parameterize and pack clean UV charts into a standard 0–1 texture atlas.
+6. **Base PBR Albedo**: Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) is repurposed as a shape-conditioned voxel texturing engine, baking base color, roughness, and metallic into a 4096×4096 atlas without seams.
+7. **15-Camera Resident GPU Projection Painting**: Eight orbit views at 15°, four elevated views at 50°, and three underside views at -50° cover the model. GPU rendering and projection share the exact saved cameras. Each view is repainted against the reference, then all views are projected onto the 4096 atlas by the resident Vulkan baker with cosine-to-the-tenth weighting and BC7 encoding. The mesh, UVs and base PBR material are preserved.
 
 Every stage runs in an isolated child process, ensuring that CUDA contexts, model weights, and allocations are completely reclaimed by the operating system before the next stage begins.
 
@@ -40,7 +41,7 @@ The detail pass uses the Real-ESRGAN SDK with x4plus weights, 512-pixel tiles, 1
 
 Add `--texel-density-map` to write `<model>-texel-density.png` and a TOML summary beside the finished GLB. The map compares final atlas texels with pixels in the sharpest visible source painting, accounting for occlusion and the baker's grazing cutoff. Blue is 0.5 texels per source pixel, cyan 1, green 2, yellow 4, orange 8 and red 16 or more. Grey marks the baker's four-texel gutter, black is outside the padded charts, and magenta has no eligible camera view. The summary separates UV occupancy, gutter and unassigned space and reports density percentiles. This measures the projection sources, independently of gameplay camera distance.
 
-By default, the fallback atlas is matched to the brightness, contrast and RGB grade of the painted views before baking. Calibration uses corresponding foreground regions with equal weight per camera; the source paintings and approved mesh remain unchanged. `--no-base-colour-match` disables this step. Original and matched base atlases plus the fitted channel gains and offsets are retained in the bake directory.
+By default, the base atlas is matched to the cutout's brightness, contrast and RGB grade before its views go to the painter, and the fallback atlas is matched again to the painted views before baking. Calibration uses corresponding foreground regions with equal weight per camera; the source paintings and approved mesh remain unchanged. `--no-base-colour-match` disables this step. `tools/render_studio.py` renders a model from the paint cameras under studio lighting for judging textures as they will look lit. Original and matched base atlases plus the fitted channel gains and offsets are retained in the bake directory.
 
 The baker retains the base colour atlas wherever no eligible painted foreground reaches the mesh. Transparent pixels and the empty black painting canvas do not overwrite that base. Hidden RGB under transparency is removed before upscaling and input compression. An existing `--base-model` keeps its geometry, UV layout and stored or implicit normals. Use `--base-material TRELLIS.glb` when a separately textured export has the same positions, indices and UVs but omitted those normals; this is validated before painting. The output retains the approved base model’s material settings and maps. The base texture stage also retains the input mesh rather than reconstructing it when attaching its material.
 
@@ -64,10 +65,11 @@ Measured on an NVIDIA GeForce RTX 5070 Ti (16 GB VRAM) generating the benchmark 
 | 1. Cutout | RMBG-2.0 | 2.4 GiB | 3s |
 | 2. Shape Generation | Hunyuan3D-2.1 (100 steps, octree 512) | 12.8 GiB | 140s |
 | 3. Surface Extraction | GPU Dual Marching Cubes (`diso`) | 4.2 GiB | 4s |
-| 4. Mesh Reduction | CuMesh cleaning & decimation (56k faces) | 3.8 GiB | 6s |
-| 5. UV Unwrapping | CuMesh xatlas UV packing | 2.1 GiB | 5s |
-| 6. Base PBR Texture | TRELLIS.2 shape-conditioned voxels (4096²) | 11.9 GiB | 45s |
-| 7. Detail Painting | 15-view resident Vulkan baker | | |
+| 4. Refinement | Hi3D v1.0 at 1024, one model on the GPU per phase | 4.5 GiB | 191s |
+| 5. Mesh Reduction | CuMesh cleaning & decimation (56k faces) | 3.8 GiB | 6s |
+| 6. UV Unwrapping | CuMesh xatlas UV packing | 2.1 GiB | 5s |
+| 7. Base PBR Texture | TRELLIS.2 shape-conditioned voxels (4096²) | 11.9 GiB | 45s |
+| 8. Detail Painting | 15-view resident Vulkan baker | | |
 
 Because each stage runs in an independent child process, peak VRAM never accumulates across models.
 
@@ -134,6 +136,7 @@ Log in once with `hf auth login` before running. If your input image already has
 | `--seed` | `12345` | Random seed for shape generation |
 | `--steps` | `100` | Hunyuan3D-2.1 flow matching diffusion steps |
 | `--octree` | `512` | Hunyuan3D-2.1 occupancy field resolution |
+| `--refine` | `1024` | Hi3D v1.0 sparse grid resolution for the dense surface: `512`, `1024`, `1536`, or `0` to disable |
 | `--no-rembg` | off | Skip RMBG-2.0 (input image must already have an alpha channel) |
 | `--dinov3` | Meta repo | Alternative Hugging Face repo for DINOv3 |
 | `--upscale` | `2` | Real-ESRGAN camera-painting super-resolution before baking: `2` doubles each dimension, `4` quadruples it, `0` disables it; the atlas stays 4096² |
@@ -146,11 +149,11 @@ Log in once with `hf auth login` before running. If your input image already has
 | `--paintings` | unset | Bake a saved directory of camera-named PNG paintings; requires `--cameras` |
 | `--painting-output` | unset | Reuse and complete camera-named paintings in this directory; requires `--cameras`; use `--paintings` for a complete read-only set |
 | `--work-dir` | automatic | Separate intermediate directory for this output |
-| `--batch` | unset | Generate base models (stages 1-6) from a table of image and work directory, loading each stage's models once; replaces the positional arguments |
+| `--batch` | unset | Generate base models (stages 1-7) from a table of image and work directory, loading each stage's models once; replaces the positional arguments |
 | `--resume` | off | Reuse completed generation stages and paintings in the output work directory |
 | `--model` | `hybrid` | Pipeline architecture: `hybrid` (Espalier-2.1), `trellis2`, or `pixal3d` |
 
-Existing installations can be reused through `ESPALIER_SHAPE_ROOT`, `ESPALIER_TRELLIS_ROOT` and `ESPALIER_FLUX_ROOT`. Set `ESPALIER_SHAPE_PYTHON`, `ESPALIER_TEXTURE_PYTHON` and `ESPALIER_FLUX_PYTHON` to their environment interpreters. Upscaling uses `ESPALIER_UPSCALE_PYTHON`, falling back to the shape interpreter and then the texture interpreter. Its environment needs BasicSR 1.4.2 and Real-ESRGAN 0.3.0. The default roots are the corresponding checkouts under `src/`; shape and texture stages otherwise use Espalier's environment.
+Every stage runs in `.venv`, FLUX aside. `ESPALIER_REFINE_MODEL` names a local weights directory for offline use. `stages/4_refine.py --phase` runs one phase at a time, so that each can hold its own GPU reservation. Existing installations can be reused through `ESPALIER_SHAPE_ROOT`, `ESPALIER_TRELLIS_ROOT` and `ESPALIER_FLUX_ROOT`. Set `ESPALIER_SHAPE_PYTHON`, `ESPALIER_TEXTURE_PYTHON` and `ESPALIER_FLUX_PYTHON` to their environment interpreters. Upscaling uses `ESPALIER_UPSCALE_PYTHON`, falling back to the shape interpreter and then the texture interpreter. Its environment needs BasicSR 1.4.2 and Real-ESRGAN 0.3.0. The default roots are the corresponding checkouts under `src/`; shape and texture stages otherwise use Espalier's environment.
 
 ## Image generation
 

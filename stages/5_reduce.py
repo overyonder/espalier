@@ -1,19 +1,19 @@
 #!/usr/bin/env python3
-"""Stage 4: Reduce & Clean Mesh. Cleans manifold topology and simplifies geometry to target face count.
+"""Stage 5: Reduce & Clean Mesh. Cleans manifold topology and simplifies geometry to target face count.
 
-  python3 stages/4_reduce.py <dense.ply> <out_reduced.ply> [--faces 56000]
+  python3 stages/5_reduce.py <refined.ply> <out_reduced.ply> [--faces 56000]
 """
 import argparse, os, sys, time, torch, numpy as np, trimesh, cumesh
 from jobs import run_jobs
 
 p = argparse.ArgumentParser()
-p.add_argument("dense", nargs="?", help="input dense mesh (.ply)")
+p.add_argument("dense", nargs="?", help="input refined or dense mesh (.ply)")
 p.add_argument("out", nargs="?", help="output reduced mesh (.ply)")
 p.add_argument("--batch", help="tab-separated table of the positional paths, holding models across its rows")
 p.add_argument("--faces", type=int, default=56000, help="target face count (default: 56000)")
 a = p.parse_args()
 
-print(f"== 4 reduce and clean (target: {a.faces} faces)", flush=True)
+print(f"== 5 reduce and clean (target: {a.faces} faces)", flush=True)
 
 def clean(m):
     m.remove_duplicate_faces()

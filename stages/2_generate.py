@@ -17,7 +17,7 @@ p.add_argument("--seed", type=int, default=12345, help="sampling seed (default: 
 a = p.parse_args()
 
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-shape_root = os.environ.get("ESPALIER_SHAPE_ROOT", os.path.join(here, "src", "Hunyuan3D-2.1"))
+shape_root = os.path.join(here, "src", "Hunyuan3D-2.1")
 sys.path.insert(0, os.path.join(shape_root, "hy3dshape"))
 sys.path.insert(0, shape_root)
 

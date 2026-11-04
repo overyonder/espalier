@@ -348,7 +348,7 @@ index 0209e69..e50419e 100644
                  v.coords[:, 1:], v.feats, i.feats, q.feats,
                  aabb=[[-0.5, -0.5, -0.5], [0.5, 0.5, 0.5]],
 diff --git a/trellis2/models/sc_vaes/sparse_unet_vae.py b/trellis2/models/sc_vaes/sparse_unet_vae.py
-index b9902a1..450aab4 100644
+index b9902a1..44fe333 100644
 --- a/trellis2/models/sc_vaes/sparse_unet_vae.py
 +++ b/trellis2/models/sc_vaes/sparse_unet_vae.py
 @@ -1,4 +1,5 @@
@@ -357,7 +357,21 @@ index b9902a1..450aab4 100644
  import torch
  import torch.nn as nn
  import torch.nn.functional as F
-@@ -284,7 +285,14 @@ class SparseConvNeXtBlock3d(nn.Module):
+@@ -201,10 +202,12 @@ class SparseResBlockS2C3d(nn.Module):
+         h = self.conv1(h)
+         h = self.updown(h)
+         x = self.updown(x)
++        skip = self.skip_connection(x)
++        del x  # Release the wide spatial-to-channel features before the second convolution.
+         h = h.replace(self.norm2(h.feats))
+         h = h.replace(F.silu(h.feats))
+         h = self.conv2(h)
+-        h = h + self.skip_connection(x)
++        h = h + skip
+         return h
+     
+     def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
+@@ -284,7 +287,14 @@ class SparseConvNeXtBlock3d(nn.Module):
      def _forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
          h = self.conv(x)
          h = h.replace(self.norm(h.feats))
@@ -365,7 +379,7 @@ index b9902a1..450aab4 100644
 +        # The MLP is per voxel, so at inference it can run over chunks of voxels. Its hidden layer is mlp_ratio times
 +        # wider than the block, the largest tensor of a decoder stage the tiling leaves whole. A chunk is a smaller
 +        # matrix product, which cuBLAS may compute with different kernels, so results can differ in rounding.
-+        chunk = int(os.environ.get('TRELLIS_DECODE_MLP_CHUNK', 0))
++        chunk = int(os.environ.get('TRELLIS_DECODE_MLP_CHUNK', 65536))
 +        if chunk and not self.training and h.feats.shape[0] > chunk:
 +            h = h.replace(torch.cat([self.mlp(part) for part in h.feats.split(chunk)]))
 +        else:
@@ -373,7 +387,7 @@ index b9902a1..450aab4 100644
          return h + x
      
      def forward(self, x: sp.SparseTensor) -> sp.SparseTensor:
-@@ -419,6 +427,10 @@ class SparseUnetVaeDecoder(nn.Module):
+@@ -419,6 +429,10 @@ class SparseUnetVaeDecoder(nn.Module):
          self.pred_subdiv = pred_subdiv
          self.dtype = torch.float16 if use_fp16 else torch.float32
          self.low_vram = False
@@ -384,7 +398,7 @@ index b9902a1..450aab4 100644
          
          self.output_layer = sp.SparseLinear(model_channels[-1], out_channels)
          self.from_latent = sp.SparseLinear(latent_channels, model_channels[0])
-@@ -478,7 +490,9 @@ class SparseUnetVaeDecoder(nn.Module):
+@@ -478,7 +492,9 @@ class SparseUnetVaeDecoder(nn.Module):
      def forward(self, x: sp.SparseTensor, guide_subs: Optional[List[sp.SparseTensor]] = None, return_subs: bool = False) -> sp.SparseTensor:
          assert guide_subs is None or self.pred_subdiv == False, "Only decoders with pred_subdiv=False can be used with guide_subs"
          assert return_subs == False or self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with return_subs"
@@ -395,7 +409,7 @@ index b9902a1..450aab4 100644
          h = self.from_latent(x)
          h = h.type(self.dtype)
          subs_gt = []
-@@ -506,6 +520,74 @@ class SparseUnetVaeDecoder(nn.Module):
+@@ -506,6 +522,74 @@ class SparseUnetVaeDecoder(nn.Module):
              else:
                  return h
      
@@ -470,6 +484,40 @@ index b9902a1..450aab4 100644
      def upsample(self, x: sp.SparseTensor, upsample_times: int) -> torch.Tensor:
          assert self.pred_subdiv == True, "Only decoders with pred_subdiv=True can be used with upsampling"
          
+@@ -519,4 +603,4 @@ class SparseUnetVaeDecoder(nn.Module):
+                     h, sub = block(h)
+                 else:
+                     h = block(h)
+-       
+\ No newline at end of file
++
+diff --git a/trellis2/modules/norm.py b/trellis2/modules/norm.py
+index 78675d0..a327f03 100644
+--- a/trellis2/modules/norm.py
++++ b/trellis2/modules/norm.py
+@@ -5,6 +5,15 @@ from .utils import manual_cast
+ 
+ class LayerNorm32(nn.LayerNorm):
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
++        # Sparse inference can contain millions of independent rows. Bound the
++        # temporary fp32 buffers without changing any row's normalization.
++        if not torch.is_grad_enabled() and x.ndim == 2 and len(self.normalized_shape) == 1 and x.numel() > 16 * 1024 * 1024:
++            rows = max(1, 16 * 1024 * 1024 // x.shape[1])
++            out = torch.empty_like(x)
++            for start in range(0, x.shape[0], rows):
++                chunk = manual_cast(x[start:start + rows], torch.float32)
++                out[start:start + rows] = super().forward(chunk)
++            return out
+         x_dtype = x.dtype
+         x = manual_cast(x, torch.float32)
+         o = super().forward(x)
+@@ -29,4 +38,4 @@ class ChannelLayerNorm32(LayerNorm32):
+         x = super().forward(x)
+         x = x.permute(0, DIM-1, *range(1, DIM-1)).contiguous()
+         return x
+-    
+\ No newline at end of file
++
 diff --git a/trellis2/pipelines/trellis2_image_to_3d.py b/trellis2/pipelines/trellis2_image_to_3d.py
 index a7b84b9..fe3cdd2 100644
 --- a/trellis2/pipelines/trellis2_image_to_3d.py

@@ -16,7 +16,7 @@ import torch, trimesh
 from skimage import measure
 from diso import DiffDMC
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-shape_root = os.environ.get("ESPALIER_SHAPE_ROOT", os.path.join(here, "src", "Hunyuan3D-2.1"))
+shape_root = os.path.join(here, "src", "Hunyuan3D-2.1")
 sys.path.insert(0, os.path.join(shape_root, "hy3dshape"))
 from hy3dshape.models.autoencoders.surface_extractors import center_vertices
 

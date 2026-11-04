@@ -24,7 +24,7 @@ def main():
     parser.add_argument("--overwrite", action="store_true", help="recompute existing outputs")
     parser.add_argument("--cameras", type=Path, help="upscale only views named in this saved camera rig")
     parser.add_argument("--tile", type=int, default=512)
-    shape = Path(os.environ.get("ESPALIER_SHAPE_ROOT", Path(__file__).resolve().parents[1] / "src/Hunyuan3D-2.1"))
+    shape = Path(__file__).resolve().parents[1] / "src/Hunyuan3D-2.1"
     parser.add_argument("--weights", type=Path, default=os.environ.get(
         "REALESRGAN_WEIGHTS", shape / "hy3dpaint/ckpt/RealESRGAN_x4plus.pth"))
     args = parser.parse_args()

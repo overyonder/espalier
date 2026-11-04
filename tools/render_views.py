@@ -61,7 +61,7 @@ sc.render.resolution_x = sc.render.resolution_y = int(os.environ.get('RENDER_RES
 # Lighting: TRELLIS.2's example environment map for soft fill from every side, a large key light from the upper left
 # that moves with the camera, and a rim light behind, with AgX tone mapping so form and small relief both read.
 w = bpy.data.worlds.new('w'); sc.world = w; w.use_nodes = True; nt = w.node_tree
-hdri_path = os.path.expanduser('~/code/models/TRELLIS.2/assets/hdri/forest.exr')
+hdri_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'src/TRELLIS.2/assets/hdri/forest.exr')
 hdri_strength = float(os.environ.get('HDRI_STRENGTH', '0.35'))
 if os.path.exists(hdri_path) and os.environ.get('FLAT') != '1':
     env = nt.nodes.new('ShaderNodeTexEnvironment'); env.image = bpy.data.images.load(hdri_path)

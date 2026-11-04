@@ -12,10 +12,11 @@ Pipeline Stages (under stages/):
   1. Cutout      (stages/1_cutout.py):   RMBG-2.0 background isolation
   2. Shape       (stages/2_generate.py): Hunyuan3D-2.1 flow matching (100 steps, octree 512)
   3. Extract     (stages/3_extract.py):  GPU Dual Marching Cubes dense surface extraction
-  4. Reduce      (stages/4_reduce.py):   CuMesh clean and decimation to target faces
-  5. Unwrap      (stages/5_unwrap.py):   CuMesh xatlas UV unwrapping
-  6. Base PBR    (stages/6_albedo.py):   TRELLIS.2 shape-conditioned PBR texturing (4096 atlas)
-  7. Detail Pass (stages/7_paint.py):    15-view resident projection painting (FLUX.3 or Codex)
+  4. Refine      (stages/4_refine.py):   Hi3D v1.0 refinement of the dense surface at 1024
+  5. Reduce      (stages/5_reduce.py):   CuMesh clean and decimation to target faces
+  6. Unwrap      (stages/6_unwrap.py):   CuMesh xatlas UV unwrapping
+  7. Base PBR    (stages/7_albedo.py):   TRELLIS.2 shape-conditioned PBR texturing (4096 atlas)
+  8. Detail Pass (stages/8_paint.py):    15-view resident projection painting (FLUX.3 or Codex)
 """
 import argparse
 import os
@@ -50,6 +51,8 @@ def parse_args():
     p.add_argument("--seed", type=int, default=None, help="sampling seed (default 12345 for hybrid, 42 for legacy)")
     p.add_argument("--steps", type=int, default=100, help="Hunyuan3D-2.1 inference steps (default: 100)")
     p.add_argument("--octree", type=int, default=512, help="Hunyuan3D-2.1 octree resolution (default: 512)")
+    p.add_argument("--refine", type=int, choices=[0, 512, 1024, 1536], default=1024,
+                   help="Hi3D v1.0 sparse grid resolution for the dense surface (default: 1024; 0 disables)")
     p.add_argument("--no-rembg", action="store_true", help="skip RMBG-2.0; input must already have an alpha channel")
     p.add_argument("--dinov3", default=None, help="alternative DINOv3 Hugging Face repository")
     p.add_argument("--prompt-file", default=None, help="custom progressive repainting prompt file")
@@ -112,14 +115,12 @@ def parse_args():
 def run_stage(script_name, *stage_args):
     """Executes a pipeline stage script in an isolated subprocess for VRAM reclamation."""
     script_path = os.path.join(here, "stages", script_name)
-    role = "SHAPE" if script_name in ("2_generate.py", "3_extract.py") else "TEXTURE"
-    python = os.environ.get(f"ESPALIER_{role}_PYTHON", sys.executable)
     environment = os.environ.copy()
-    trellis = environment.get("ESPALIER_TRELLIS_ROOT", os.path.join(here, "src", "TRELLIS.2"))
-    shape = environment.get("ESPALIER_SHAPE_ROOT", os.path.join(here, "src", "Hunyuan3D-2.1"))
+    trellis = os.path.join(here, "src", "TRELLIS.2")
+    shape = os.path.join(here, "src", "Hunyuan3D-2.1")
     paths = [trellis, os.path.join(shape, "hy3dshape"), shape, environment.get("PYTHONPATH", "")]
     environment["PYTHONPATH"] = os.pathsep.join(path for path in paths if path)
-    cmd = [python, script_path, *stage_args]
+    cmd = [sys.executable, script_path, *stage_args]
     print(f"START {script_name}", flush=True)
     subprocess.run(cmd, check=True, env=environment, timeout=3600)
     print(f"DONE {script_name}", flush=True)
@@ -130,7 +131,7 @@ def generate_batch(a):
     with open(a.batch) as rows:
         jobs = [row.rstrip("\n").split("\t") for row in rows if row.strip()]
     paths = [(image, *(os.path.join(os.path.abspath(work), name) for name in
-                       ("cutout.png", "field.pt", "dense.ply", "reduced.ply", "unwrapped.glb", "trellis.glb")))
+                       ("cutout.png", "field.pt", "dense.ply", "reduced.ply", "unwrapped.glb", "trellis.glb", "refined.ply")))
              for image, work in jobs]
     def run_batch_stage(script, columns, *arguments):
         with tempfile.NamedTemporaryFile("w", suffix=".tsv") as table:
@@ -147,11 +148,15 @@ def generate_batch(a):
     for p in pending:
         if os.path.isfile(p[3]) and os.path.isfile(p[2]):
             os.remove(p[2])
-    run_batch_stage("4_reduce.py", [(p[3], p[4]) for p in pending], "--faces", str(a.faces))
-    run_batch_stage("5_unwrap.py", [(p[4], p[5]) for p in pending])
+    # A mesh already reduced from the unrefined surface keeps it, so that its later stages stay consistent.
+    if a.refine:
+        run_batch_stage("4_refine.py", [(p[1], p[3], p[7]) for p in pending if not os.path.isfile(p[4])], "--resolution", str(a.refine))
+    detailed = lambda p: p[7] if os.path.isfile(p[7]) else p[3]
+    run_batch_stage("5_reduce.py", [(detailed(p), p[4]) for p in pending], "--faces", str(a.faces))
+    run_batch_stage("6_unwrap.py", [(p[4], p[5]) for p in pending])
     if final == 6:
         albedo_arguments = ["--texture", str(a.texture)] + (["--dinov3", a.dinov3] if a.dinov3 else [])
-        run_batch_stage("6_albedo.py", [(p[1], p[3], p[5], p[6]) for p in pending], *albedo_arguments)
+        run_batch_stage("7_albedo.py", [(p[1], detailed(p), p[5], p[6]) for p in pending], *albedo_arguments)
     failed = [p[final] for p in paths if not os.path.isfile(p[final])]
     print(f"BATCH_COMPLETE {len(paths) - len(failed)}/{len(paths)}", *failed, flush=True)
 
@@ -188,6 +193,7 @@ def main():
     cutout_png = os.path.join(work, "cutout.png")
     field_pt = os.path.join(work, "field.pt")
     dense_ply = os.path.join(work, "dense.ply")
+    refined_ply = os.path.join(work, "refined.ply")
     reduced_ply = os.path.join(work, "reduced.ply")
     unwrapped_glb = os.path.join(work, "unwrapped.glb")
     base_trellis_glb = os.path.join(work, "trellis.glb")
@@ -214,26 +220,31 @@ def main():
         # Stage 3: Surface Extraction
         generate_stage("3_extract.py", dense_ply, field_pt, dense_ply)
 
-        # Stage 4: Mesh Reduction & Cleaning
-        generate_stage("4_reduce.py", reduced_ply, dense_ply, reduced_ply, "--faces", str(a.faces))
+        # Stage 4: Refinement. A mesh already reduced from the unrefined surface keeps it, so that its later stages stay consistent.
+        if a.refine and not os.path.isfile(reduced_ply):
+            generate_stage("4_refine.py", refined_ply, cutout_png, dense_ply, refined_ply, "--resolution", str(a.refine))
+        detailed_ply = refined_ply if os.path.isfile(refined_ply) else dense_ply
 
-        # Stage 5: UV Unwrap
-        generate_stage("5_unwrap.py", unwrapped_glb, reduced_ply, unwrapped_glb)
+        # Stage 5: Mesh Reduction & Cleaning
+        generate_stage("5_reduce.py", reduced_ply, detailed_ply, reduced_ply, "--faces", str(a.faces))
 
-        # Stage 6: Base PBR Texture
-        albedo_args = [cutout_png, dense_ply, unwrapped_glb, base_trellis_glb, "--texture", str(a.texture)]
+        # Stage 6: UV Unwrap
+        generate_stage("6_unwrap.py", unwrapped_glb, reduced_ply, unwrapped_glb)
+
+        # Stage 7: Base PBR Texture
+        albedo_args = [cutout_png, detailed_ply, unwrapped_glb, base_trellis_glb, "--texture", str(a.texture)]
         if a.dinov3:
             albedo_args.extend(["--dinov3", a.dinov3])
-        generate_stage("6_albedo.py", base_trellis_glb, *albedo_args)
+        generate_stage("7_albedo.py", base_trellis_glb, *albedo_args)
         if a.base_model:
             base_trellis_glb = os.path.abspath(a.base_model)
 
-        # Stage 7: Detail Painting (if requested)
+        # Stage 8: Detail Painting (if requested)
         if a.paint in ("flux", "gpt"):
             paint_args = [base_trellis_glb, a.image, work, final_out,
                           "--model", a.paint, "--texture", str(a.texture),
                           "--upscale", str(a.upscale)]
-            paint_args.extend(["--paint-base", a.paint_base])
+            paint_args.extend(["--paint-base", a.paint_base, "--colour-reference", cutout_png])
             if a.no_base_colour_match:
                 paint_args.append("--no-base-colour-match")
             if a.texel_density_map:
@@ -245,7 +256,7 @@ def main():
                 paint_args.extend(["--prompt-file", a.prompt_file])
             if a.flux_dir:
                 paint_args.extend(["--flux-dir", a.flux_dir])
-            run_stage("7_paint.py", *paint_args)
+            run_stage("8_paint.py", *paint_args)
         else:
             shutil.copy(base_trellis_glb, final_out)
 

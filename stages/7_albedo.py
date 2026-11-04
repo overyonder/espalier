@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Stage 6: Base PBR Texture. Generates base colour, metallic, and roughness maps via TRELLIS.2 texturing pipeline.
+"""Stage 7: Base PBR Texture. Generates base colour, metallic, and roughness maps via TRELLIS.2 texturing pipeline.
 
-  python3 stages/6_albedo.py <cutout.png> <dense.ply> <unwrapped.glb> <out_base.glb> [--texture 4096] [--dinov3 <repo>]
+  python3 stages/7_albedo.py <cutout.png> <refined.ply> <unwrapped.glb> <out_base.glb> [--texture 4096] [--dinov3 <repo>]
 """
 import argparse, os, sys, time
 import numpy as np, torch, trimesh, cv2, flex_gemm, nvdiffrast.torch as dr
@@ -11,17 +11,19 @@ from jobs import run_jobs
 
 p = argparse.ArgumentParser()
 p.add_argument("cutout", nargs="?", help="input cutout PNG")
-p.add_argument("dense", nargs="?", help="input dense mesh (.ply)")
+p.add_argument("dense", nargs="?", help="input refined or dense mesh (.ply)")
 p.add_argument("unwrapped", nargs="?", help="input unwrapped model (.glb)")
 p.add_argument("out", nargs="?", help="output base textured model (.glb)")
 p.add_argument("--batch", help="tab-separated table of the positional paths, holding models across its rows")
 p.add_argument("--texture", type=int, default=4096, help="texture atlas size (default: 4096)")
 p.add_argument("--dinov3", default=None, help="alternative DINOv3 repository")
+p.add_argument("--guidance", type=float, help="classifier-free guidance strength (default: the pipeline's)")
+p.add_argument("--seed", type=int, default=42, help="texture sampling seed (default: 42)")
 a = p.parse_args()
 
 from cumesh import cuBVH
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.environ.get("ESPALIER_TRELLIS_ROOT", os.path.join(here, "src", "TRELLIS.2")))
+sys.path.insert(0, os.path.join(here, "src", "TRELLIS.2"))
 from trellis2.modules import image_feature_extractor
 from trellis2.pipelines import Trellis2TexturingPipeline
 if a.dinov3:
@@ -54,8 +56,9 @@ def generate_texture(image_path, resolution, texture_size, shape_path, unwrapped
     shape_normalised = trimesh.Trimesh(normalise(np.asarray(shape.vertices)), shape.faces, process=False)
     image = pipeline.preprocess_image(Image.open(image_path))
     cond = timed('image conditioning', lambda: pipeline.get_cond([image], 512 if resolution == 512 else 1024))
+    torch.manual_seed(a.seed)
     shape_latent = timed('voxelise and encode the shape mesh', lambda: pipeline.encode_shape_slat(shape_normalised, resolution))
-    texture = timed('generate texture latent', lambda: pipeline.sample_tex_slat(cond, pipeline.models[f'tex_slat_flow_model_{resolution}'], shape_latent, {}))
+    texture = timed('generate texture latent', lambda: pipeline.sample_tex_slat(cond, pipeline.models[f'tex_slat_flow_model_{resolution}'], shape_latent, {} if a.guidance is None else {'guidance_strength': a.guidance}))
     del cond, shape_latent
     torch.cuda.empty_cache()
     voxels = timed('decode PBR voxels', lambda: pipeline.decode_tex_slat(texture))
