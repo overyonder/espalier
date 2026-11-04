@@ -111,7 +111,7 @@ def generate_texture(image_path, resolution, texture_size, shape_path, unwrapped
         alpha = cv2.inpaint(channel('alpha'), empty, 1, cv2.INPAINT_TELEA)[..., None]
         material = trimesh.visual.material.PBRMaterial(baseColorTexture=Image.fromarray(np.concatenate([base_color, alpha], -1)),
                                                        metallicRoughnessTexture=Image.fromarray(np.concatenate([np.zeros_like(metallic), roughness, metallic], -1)),
-                                                       metallicFactor=1.0, roughnessFactor=1.0, alphaMode='OPAQUE', doubleSided=True)
+                                                       metallicFactor=1.0, roughnessFactor=1.0, alphaMode='OPAQUE', doubleSided=False)
         # Changing the material must retain the unwrapped mesh's stored normals.
         unwrapped.visual.material = material
         unwrapped.export(out + '.partial.glb')

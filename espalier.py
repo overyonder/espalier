@@ -4,8 +4,8 @@
 Master CLI orchestrator directing each stage in an isolated process to ensure complete
 GPU memory reclamation between model steps.
 
-  espalier <image> <output directory or out.glb> [--model hybrid|trellis2]
-           [--paint flux|gpt|none] [--gpt-image] [--faces 56000] [--texture 4096]
+  espalier <image> <output directory or out.glb>
+           [--paint gpt|flux|none] [--faces 56000] [--texture 4096]
            [--steps 100] [--octree 512] [--seed 12345] [--no-rembg]
 
 Pipeline Stages (under stages/):
@@ -16,7 +16,8 @@ Pipeline Stages (under stages/):
   5. Reduce      (stages/5_reduce.py):   CuMesh clean and decimation to target faces
   6. Unwrap      (stages/6_unwrap.py):   CuMesh xatlas UV unwrapping
   7. Base PBR    (stages/7_albedo.py):   TRELLIS.2 shape-conditioned PBR texturing (4096 atlas)
-  8. Detail Pass (stages/8_paint.py):    15-view resident projection painting (FLUX.3 or Codex)
+  8. Detail Pass (stages/8_paint.py):    15-view resident projection painting (Codex gpt-image or FLUX.3)
+  9. Restore     (stages/9_detail.py):   subdivision displaced onto the dense surface, on the same atlas, for Nanite
 """
 import argparse
 import os
@@ -40,15 +41,12 @@ def parse_args():
     p.add_argument("output", nargs="?", help="output directory or output .glb path")
     p.add_argument("--batch", help="generate base models with each stage's models held across a table of image and work directory")
     p.add_argument("--batch-through", choices=["unwrap", "texture"], default="texture", help="last stage a --batch run performs")
-    p.add_argument("--model", default="hybrid", choices=["hybrid", "trellis2"],
-                   help="hybrid (Hunyuan3D shape + TRELLIS.2 PBR texture, default) or trellis2")
-    p.add_argument("--paint", default="flux", choices=["flux", "gpt", "none"],
-                   help="detail pass: 'flux' (FLUX.3 [klein] offline painting, default), 'gpt' (Codex endpoint), or 'none'")
-    p.add_argument("--gpt-image", action="store_true", help="shortcut for --paint gpt")
+    p.add_argument("--paint", default="gpt", choices=["gpt", "flux", "none"],
+                   help="detail pass: 'gpt' (Codex endpoint, default), 'flux' (FLUX.3 [klein] offline painting), or 'none'")
     p.add_argument("--flux-dir", default=None, help="directory holding flux-3-image-klein checkout and weights")
-    p.add_argument("--faces", type=int, default=None, help="target face count (default 56000 for hybrid, 1000000 for legacy)")
+    p.add_argument("--faces", type=int, default=56000, help="target face count before painting (default: 56000)")
     p.add_argument("--texture", type=int, default=4096, help="texture atlas resolution (default: 4096)")
-    p.add_argument("--seed", type=int, default=None, help="sampling seed (default 12345 for hybrid, 42 for legacy)")
+    p.add_argument("--seed", type=int, default=12345, help="sampling seed (default: 12345)")
     p.add_argument("--steps", type=int, default=100, help="Hunyuan3D-2.1 inference steps (default: 100)")
     p.add_argument("--octree", type=int, default=512, help="Hunyuan3D-2.1 octree resolution (default: 512)")
     p.add_argument("--refine", type=int, choices=[0, 512, 1024, 1536], default=1024,
@@ -63,6 +61,7 @@ def parse_args():
     p.add_argument("--paintings", help="reuse paintings from this directory (requires --cameras)")
     p.add_argument("--painting-output", help="reuse and complete paintings in this directory; requires --cameras")
     p.add_argument("--resume", action="store_true", help="resume completed stages in the output work directory")
+    p.add_argument("--detail-levels", type=int, default=2, help="subdivisions displaced onto the dense surface after painting, each four times the faces; 0 keeps the reduced mesh (default: 2)")
     p.add_argument("--work-dir", help="directory for intermediate stage outputs")
     p.add_argument("--upscale", type=int, choices=[0, 2, 4], default=2,
                    help="Real-ESRGAN painting upscale before baking; atlas stays 4096 (default: 2; 0 disables)")
@@ -71,24 +70,12 @@ def parse_args():
                    help="write source-pixel density and UV occupancy beside the finished model")
 
     # Legacy Espalier-2 options:
-    p.add_argument("--pipeline", default="1536_cascade", choices=["512", "1024", "1024_cascade", "1536_cascade"])
-    p.add_argument("--tile", type=int, default=None)
-    p.add_argument("--max-tokens", type=int, default=49152)
-    p.add_argument("--no-texture", action="store_true")
 
     a = p.parse_args()
-    if a.faces is None:
-        a.faces = 56000 if a.model == "hybrid" else 1000000
-    if a.seed is None:
-        a.seed = 12345 if a.model == "hybrid" else 42
     if a.batch:
-        if a.model != "hybrid":
-            p.error("--batch is supported by the hybrid pipeline")
         return a
     if not a.image or not a.output:
         p.error("image and output are required without --batch")
-    if a.gpt_image:
-        a.paint = "gpt"
 
     if a.prompt_file and not os.path.isfile(a.prompt_file):
         p.error(f"Prompt file does not exist: {a.prompt_file}")
@@ -98,12 +85,10 @@ def parse_args():
         p.error("--base-material requires --base-model")
     if a.paintings and a.painting_output:
         p.error("Choose --paintings or --painting-output")
-    if a.base_model and a.model != "hybrid":
-        p.error("--base-model is supported by the hybrid pipeline")
-    if a.model == "hybrid" and a.texture != 4096:
-        p.error("The hybrid baker uses a 4096 atlas; --upscale changes source painting resolution")
-    if a.texel_density_map and (a.model != "hybrid" or a.paint == "none"):
-        p.error("--texel-density-map requires a painted hybrid run")
+    if a.texture != 4096:
+        p.error("The baker uses a 4096 atlas; --upscale changes source painting resolution")
+    if a.texel_density_map and a.paint == "none":
+        p.error("--texel-density-map requires a painted run")
     return a
 
 
@@ -162,7 +147,7 @@ def main():
         generate_batch(a)
         return
 
-    if a.model == "hybrid" and a.paint == "flux":
+    if a.paint == "flux":
         print(
             "Warning: Local FLUX and Qwen inpainting did not preserve reference "
             "colours adequately in our comparison tests. Our tested workflow "
@@ -192,87 +177,76 @@ def main():
     reduced_ply = os.path.join(work, "reduced.ply")
     unwrapped_glb = os.path.join(work, "unwrapped.glb")
     base_trellis_glb = os.path.join(work, "trellis.glb")
+    painted_glb = os.path.join(work, "painted.glb")
 
-    if a.model == "hybrid":
-        def generate_stage(script, output, *args):
-            if a.base_model:
-                return
-            if a.resume and os.path.isfile(output) and os.path.getsize(output):
-                print(f"REUSE {output}", flush=True)
-                return
-            run_stage(script, *args)
-
-        # Stage 1: Cutout
-        cutout_args = [a.image, cutout_png]
-        if a.no_rembg:
-            cutout_args.append("--no-rembg")
-        generate_stage("1_cutout.py", cutout_png, *cutout_args)
-
-        # Stage 2: Shape Generation
-        generate_stage("2_generate.py", field_pt, cutout_png, field_pt,
-                  "--steps", str(a.steps), "--octree", str(a.octree), "--seed", str(a.seed))
-
-        # Stage 3: Surface Extraction
-        generate_stage("3_extract.py", dense_ply, field_pt, dense_ply)
-
-        # Stage 4: Refinement. A mesh already reduced from the unrefined surface keeps it, so that its later stages stay consistent.
-        if a.refine and not os.path.isfile(reduced_ply):
-            generate_stage("4_refine.py", refined_ply, cutout_png, dense_ply, refined_ply, "--resolution", str(a.refine))
-        detailed_ply = refined_ply if os.path.isfile(refined_ply) else dense_ply
-
-        # Stage 5: Mesh Reduction & Cleaning
-        generate_stage("5_reduce.py", reduced_ply, detailed_ply, reduced_ply, "--faces", str(a.faces))
-
-        # Stage 6: UV Unwrap
-        generate_stage("6_unwrap.py", unwrapped_glb, reduced_ply, unwrapped_glb)
-
-        # Stage 7: Base PBR Texture
-        albedo_args = [cutout_png, detailed_ply, unwrapped_glb, base_trellis_glb, "--texture", str(a.texture)]
-        if a.dinov3:
-            albedo_args.extend(["--dinov3", a.dinov3])
-        generate_stage("7_albedo.py", base_trellis_glb, *albedo_args)
+    def generate_stage(script, output, *args):
         if a.base_model:
-            base_trellis_glb = os.path.abspath(a.base_model)
+            return
+        if a.resume and os.path.isfile(output) and os.path.getsize(output):
+            print(f"REUSE {output}", flush=True)
+            return
+        run_stage(script, *args)
 
-        # Stage 8: Detail Painting (if requested)
-        if a.paint in ("flux", "gpt"):
-            paint_args = [base_trellis_glb, a.image, work, final_out,
-                          "--model", a.paint, "--texture", str(a.texture),
-                          "--upscale", str(a.upscale)]
-            paint_args.extend(["--paint-base", a.paint_base, "--colour-reference", cutout_png])
-            if a.no_base_colour_match:
-                paint_args.append("--no-base-colour-match")
-            if a.texel_density_map:
-                paint_args.append("--texel-density-map")
-            for flag, value in (("--base-material", a.base_material), ("--cameras", a.cameras), ("--paintings", a.paintings), ("--painting-output", a.painting_output)):
-                if value:
-                    paint_args.extend([flag, os.path.abspath(value)])
-            if a.prompt_file:
-                paint_args.extend(["--prompt-file", a.prompt_file])
-            if a.flux_dir:
-                paint_args.extend(["--flux-dir", a.flux_dir])
-            run_stage("8_paint.py", *paint_args)
-        else:
-            shutil.copy(base_trellis_glb, final_out)
+    # Stage 1: Cutout
+    cutout_args = [a.image, cutout_png]
+    if a.no_rembg:
+        cutout_args.append("--no-rembg")
+    generate_stage("1_cutout.py", cutout_png, *cutout_args)
 
-        print(f"\nEspalier-2.1 complete: {final_out}")
+    # Stage 2: Shape Generation
+    generate_stage("2_generate.py", field_pt, cutout_png, field_pt,
+              "--steps", str(a.steps), "--octree", str(a.octree), "--seed", str(a.seed))
 
+    # Stage 3: Surface Extraction
+    generate_stage("3_extract.py", dense_ply, field_pt, dense_ply)
+
+    # Stage 4: Refinement. A mesh already reduced from the unrefined surface keeps it, so that its later stages stay consistent.
+    if a.refine and not os.path.isfile(reduced_ply):
+        generate_stage("4_refine.py", refined_ply, cutout_png, dense_ply, refined_ply, "--resolution", str(a.refine))
+    detailed_ply = refined_ply if os.path.isfile(refined_ply) else dense_ply
+
+    # Stage 5: Mesh Reduction & Cleaning
+    generate_stage("5_reduce.py", reduced_ply, detailed_ply, reduced_ply, "--faces", str(a.faces))
+
+    # Stage 6: UV Unwrap
+    generate_stage("6_unwrap.py", unwrapped_glb, reduced_ply, unwrapped_glb)
+
+    # Stage 7: Base PBR Texture
+    albedo_args = [cutout_png, detailed_ply, unwrapped_glb, base_trellis_glb, "--texture", str(a.texture)]
+    if a.dinov3:
+        albedo_args.extend(["--dinov3", a.dinov3])
+    generate_stage("7_albedo.py", base_trellis_glb, *albedo_args)
+    if a.base_model:
+        base_trellis_glb = os.path.abspath(a.base_model)
+
+    # Stage 8: Detail Painting (if requested)
+    if a.paint in ("flux", "gpt"):
+        paint_args = [base_trellis_glb, a.image, work, painted_glb,
+                      "--model", a.paint, "--texture", str(a.texture),
+                      "--upscale", str(a.upscale)]
+        paint_args.extend(["--paint-base", a.paint_base, "--colour-reference", cutout_png])
+        if a.no_base_colour_match:
+            paint_args.append("--no-base-colour-match")
+        if a.texel_density_map:
+            paint_args.append("--texel-density-map")
+        for flag, value in (("--base-material", a.base_material), ("--cameras", a.cameras), ("--paintings", a.paintings), ("--painting-output", a.painting_output)):
+            if value:
+                paint_args.extend([flag, os.path.abspath(value)])
+        if a.prompt_file:
+            paint_args.extend(["--prompt-file", a.prompt_file])
+        if a.flux_dir:
+            paint_args.extend(["--flux-dir", a.flux_dir])
+        run_stage("8_paint.py", *paint_args)
     else:
-        # Legacy Espalier-2 models
-        for st in ("generate", "export"):
-            legacy_args = [a.image, out_dir, "--pipeline", a.pipeline,
-                           "--seed", str(a.seed), "--texture", str(a.texture),
-                           "--faces", str(a.faces), "--stage", st]
-            legacy_args.extend(["--max-tokens", str(a.max_tokens)])
-            if a.tile is not None:
-                legacy_args.extend(["--tile", str(a.tile)])
-            if a.no_texture:
-                legacy_args.append("--no-texture")
-            if a.no_rembg:
-                legacy_args.append("--no-rembg")
-            if a.dinov3:
-                legacy_args.extend(["--dinov3", a.dinov3])
-            run_stage("legacy_trellis.py", *legacy_args)
+        painted_glb = base_trellis_glb
+
+    # Stage 9: Restore Detail
+    if a.detail_levels:
+        run_stage("9_detail.py", painted_glb, detailed_ply, final_out, "--levels", str(a.detail_levels))
+    else:
+        shutil.copy(painted_glb, final_out)
+
+    print(f"\nEspalier-2.1 complete: {final_out}")
 
 
 if __name__ == "__main__":

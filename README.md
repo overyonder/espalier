@@ -27,11 +27,11 @@ The top row is the GLB published on the Microsoft TRELLIS.2 project page. The bo
 
 The detail pass runs multi-view projection painting over the 4096 texture atlas:
 
-- **Offline Local Default (`--paint flux`)**: Uses [FLUX.3 [klein]](https://github.com/black-forest-labs/flux-3-image-klein) with sequential model offloading to run locally on a 16 GB GPU.
-- **Codex GPT-Image (`--paint gpt` or `--gpt-image`)**: Uses the ChatGPT plan's Codex endpoint (authenticating through local `~/.codex/auth.json`).
+- **Codex GPT-Image (`--paint gpt`, the default)**: Uses the ChatGPT plan's Codex endpoint (authenticating through local `~/.codex/auth.json`).
+- **Offline Local (`--paint flux`)**: Uses [FLUX.3 [klein]](https://github.com/black-forest-labs/flux-3-image-klein) with sequential model offloading to run locally on a 16 GB GPU.
 - **Base PBR Only (`--paint none`)**: Skips the detail painting pass and exports the base TRELLIS.2 PBR texture.
 
-In our comparison tests, local FLUX and Qwen inpainting did not preserve reference colours adequately. Our tested workflow requires API inpainting for good reference-colour fidelity. FLUX remains the default local option.
+In our comparison tests, local FLUX and Qwen inpainting did not preserve reference colours adequately, so API inpainting is the default.
 
 New cameras fit the lens and shift so the object's outline fills 92% of the canvas from the same viewpoint. Each GPT painting is compared with its input render for size, placement and silhouette shape. A view that is missing or fails has its saved camera fitted the same way, is rendered again and painted again, up to three attempts, keeping the best. Rejected paintings stay in the work directory's `attempts/`, `paint-check.json` beside the paintings records each result so a resume doesn't repeat them, and a reused `--cameras` file is rewritten to stay paired with the paintings. `--paintings` is used as given, without checks.
 
@@ -70,6 +70,7 @@ Measured on an NVIDIA GeForce RTX 5070 Ti (16 GB VRAM) generating the benchmark 
 | 6. UV Unwrapping | CuMesh xatlas UV packing | 2.1 GiB | 5s |
 | 7. Base PBR Texture | TRELLIS.2 shape-conditioned voxels (4096²) | 11.9 GiB | 45s |
 | 8. Detail Painting | 15-view resident Vulkan baker | | |
+| 9. Restore Detail | Subdivision displaced onto the dense surface (865k faces) | 0.2 GiB | 16s |
 
 Because each stage runs in an independent child process, peak VRAM never accumulates across models.
 
@@ -103,20 +104,20 @@ Log in once with `hf auth login` before running. If your input image already has
 ## Running
 
 ```sh
-# Default hybrid pipeline with local FLUX.3 detail painting
+# Default pipeline with Codex GPT-image detail painting
 ./espalier input.png out/
 
-# With Codex GPT-image detail painting
-./espalier input.png out/ --paint gpt
+# With local FLUX.3 detail painting
+./espalier input.png out/ --paint flux
 
 # Paint camera-space normals instead of the TRELLIS texture
-./espalier input.png out/ --paint gpt --paint-base normals
+./espalier input.png out/ --paint-base normals
 
 # Resume completed stages and paintings
-./espalier input.png out/ --paint gpt --resume
+./espalier input.png out/ --resume
 
 # Repaint an existing model while preserving its geometry and UVs
-./espalier reference.png out/ --base-model base.glb --paint gpt
+./espalier reference.png out/ --base-model base.glb
 
 # Output directly to a specific GLB file
 ./espalier input.png path/to/model.glb
@@ -129,8 +130,7 @@ Log in once with `hf auth login` before running. If your input image already has
 
 | Option | Default | Meaning |
 | --- | --- | --- |
-| `--paint` | `flux` | Detail painter: `flux` (local FLUX.3 [klein]), `gpt` (Codex endpoint), or `none` |
-| `--gpt-image` | off | Shortcut for `--paint gpt` |
+| `--paint` | `gpt` | Detail painter: `gpt` (Codex endpoint), `flux` (local FLUX.3 [klein]), or `none` |
 | `--faces` | `56000` | Target triangle count for simplified geometry |
 | `--texture` | `4096` | Texture atlas resolution (width and height) |
 | `--seed` | `12345` | Random seed for shape generation |
@@ -151,7 +151,6 @@ Log in once with `hf auth login` before running. If your input image already has
 | `--work-dir` | automatic | Separate intermediate directory for this output |
 | `--batch` | unset | Generate base models (stages 1-7) from a table of image and work directory, loading each stage's models once; replaces the positional arguments |
 | `--resume` | off | Reuse completed generation stages and paintings in the output work directory |
-| `--model` | `hybrid` | Pipeline architecture: `hybrid` (Espalier-2.1) or `trellis2` |
 
 Every stage runs in `.venv`, FLUX aside. `ESPALIER_REFINE_MODEL` names a local weights directory for offline use. `stages/4_refine.py --phase` runs one phase at a time, so that each can hold its own GPU reservation. Existing installations can be reused through `ESPALIER_SHAPE_ROOT`, `ESPALIER_TRELLIS_ROOT` and `ESPALIER_FLUX_ROOT`. Set `ESPALIER_SHAPE_PYTHON`, `ESPALIER_TEXTURE_PYTHON` and `ESPALIER_FLUX_PYTHON` to their environment interpreters. Upscaling uses `ESPALIER_UPSCALE_PYTHON`, falling back to the shape interpreter and then the texture interpreter. Its environment needs BasicSR 1.4.2 and Real-ESRGAN 0.3.0. The default roots are the corresponding checkouts under `src/`; shape and texture stages otherwise use Espalier's environment.
 

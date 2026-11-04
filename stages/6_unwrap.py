@@ -21,8 +21,14 @@ def unwrap(reduced_path, out):
               torch.tensor(np.asarray(m.faces), dtype=torch.int32).cuda())
     vertices, faces, uvs, _ = mesh.uv_unwrap(return_vmaps=True)
     material = trimesh.visual.material.PBRMaterial(baseColorFactor=[115, 110, 105, 255], metallicFactor=0.0, roughnessFactor=0.8)
-    trimesh.Trimesh(vertices.cpu().numpy(), faces.cpu().numpy(), process=False,
-                    visual=trimesh.visual.TextureVisuals(uv=uvs.cpu().numpy(), material=material)).export(out)
+    unwrapped = trimesh.Trimesh(vertices.cpu().numpy(), faces.cpu().numpy(), process=False,
+                                visual=trimesh.visual.TextureVisuals(uv=uvs.cpu().numpy(), material=material))
+    # Vertices split along an atlas seam share one normal, or the seam shows as a crease.
+    _, welded = np.unique(unwrapped.vertices, axis=0, return_inverse=True)
+    normals = np.zeros((welded.max() + 1, 3))
+    np.add.at(normals, welded, unwrapped.vertex_normals)
+    unwrapped.vertex_normals = (normals / np.linalg.norm(normals, axis=1, keepdims=True))[welded]
+    unwrapped.export(out, include_normals=True)
     print(f"unwrapped in {time.time() - started:.1f}s -> {out}", flush=True)
 
 run_jobs(a.batch, (a.reduced, a.out), unwrap)
