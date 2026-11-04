@@ -95,7 +95,7 @@ FLUX uses a separate Python environment because its dependencies differ from the
 ### Hugging Face Access
 
 Two models loaded by the pipeline require accepted terms on Hugging Face:
-- [DINOv3 ViT-L/16](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m) (or specify `--dinov3 devvcamp07/dinov3-mirror`)
+- [DINOv3 ViT-L/16](https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m)
 - [RMBG-2.0](https://huggingface.co/briaai/RMBG-2.0)
 
 Log in once with `hf auth login` before running. If your input image already has an alpha channel, `--no-rembg` skips RMBG-2.0.
