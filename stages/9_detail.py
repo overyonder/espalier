@@ -14,7 +14,7 @@ p.add_argument("model", nargs="?", help="textured model (.glb), one primitive")
 p.add_argument("dense", nargs="?", help="dense surface in the same frame (.ply)")
 p.add_argument("out", nargs="?", help="output model (.glb)")
 p.add_argument("--batch", help="tab-separated table of the positional paths, holding models across its rows")
-p.add_argument("--levels", type=int, default=2, help="subdivision levels, each multiplying the faces by four (default: 2)")
+p.add_argument("--levels", type=int, default=2, help="most subdivision levels, each four times the faces, stopping before the dense surface's count (default: 2)")
 a = p.parse_args()
 
 print(f"== 9 restore detail ({a.levels} levels)", flush=True)
@@ -91,10 +91,12 @@ def restore_detail(model_path, dense_path, out):
     uvs = torch.tensor(accessor(document, binary, primitive["attributes"]["TEXCOORD_0"]), dtype=torch.float32).cuda()
     faces = torch.tensor(accessor(document, binary, primitive["indices"]).reshape(-1, 3).astype("i8"), dtype=torch.long).cuda()
     positions, welded = torch.unique(wedge_positions, dim=0, return_inverse=True)
+    dense = trimesh.load(dense_path, process=False, force="mesh")
     for _ in range(a.levels):
+        if len(faces) * 4 > len(dense.faces):
+            break
         welded, faces, uvs, positions = subdivide(welded, faces, uvs, positions)
 
-    dense = trimesh.load(dense_path, process=False, force="mesh")
     surface = cuBVH(dense.vertices, dense.faces)
     surface_vertices = torch.tensor(np.asarray(dense.vertices), dtype=torch.float32).cuda()
     surface_faces = torch.tensor(np.asarray(dense.faces), dtype=torch.long).cuda()
