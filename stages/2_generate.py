@@ -3,7 +3,10 @@
 
   python3 stages/2_generate.py <cutout.png> <out_field.pt> [--steps 100] [--octree 512] [--seed 12345]
 """
-import argparse, os, sys, time, torch
+import argparse, os, sys, time
+# FlashVDM's varying query batches fragment the default allocator, to 11 GiB reserved for 4.6 GiB in use.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+import torch
 from PIL import Image
 from jobs import run_jobs
 
@@ -73,6 +76,8 @@ def load_decoder(module, _inputs):
     module.to("cuda")
 
 pipe.vae.register_forward_pre_hook(load_decoder)
+# Decodes only near the surface, which leaves NaN elsewhere. The octree rounds down to 504 at the requested 512.
+pipe.vae.enable_flashvdm_decoder(enabled=True, adaptive_kv_selection=True, topk_mode='mean', mc_algo='dmc')
 
 class FieldSaved(Exception):
     pass

@@ -7,7 +7,7 @@ Earlier image-to-3D models attempted to generate geometry and surface textures i
 soft, blurry voxel textures and noisy geometry. Espalier-2.1 completely decouples geometry reconstruction from
 surface appearance and multi-view projection painting:
 
-1. **Precision Neural Shape**: Tencent's [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) generates a watertight 3D occupancy field at 100 flow matching steps and octree resolution 512.
+1. **Precision Neural Shape**: Tencent's [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) generates a watertight 3D occupancy field at 100 flow matching steps and octree resolution 512, decoded near the surface with FlashVDM.
 2. **Dense Surface Extraction**: GPU Dual Marching Cubes (DMC via `diso`) extracts the manifold triangular surface.
 3. **Refinement**: [Hi3D v1.0](https://github.com/hi3d-official/Hi3Dv1.0) refines the dense surface against the reference image at a 1024 sparse grid.
 4. **Decimation & Repair**: CuMesh cleans duplicate geometry, fills holes, and decimates the refined mesh to a production-ready 56,000 face budget.
@@ -63,8 +63,8 @@ Measured on an NVIDIA GeForce RTX 5070 Ti (16 GB VRAM) generating the benchmark 
 | Stage | Technology | Peak VRAM | Time |
 | --- | --- | --- | --- |
 | 1. Cutout | RMBG-2.0 | 2.4 GiB | 3s |
-| 2. Shape Generation | Hunyuan3D-2.1 (100 steps, octree 512) | 12.8 GiB | 140s |
-| 3. Surface Extraction | GPU Dual Marching Cubes (`diso`) | 4.2 GiB | 4s |
+| 2. Shape Generation | Hunyuan3D-2.1 (100 steps, octree 512, FlashVDM decode) | 12.8 GiB | 78s and up, with surface area |
+| 3. Surface Extraction | GPU Dual Marching Cubes (`diso`) | 4.2 GiB | 14s |
 | 4. Refinement | Hi3D v1.0 at 1024, one model on the GPU per phase | 4.5 GiB | 191s |
 | 5. Mesh Reduction | CuMesh cleaning & decimation (56k faces) | 3.8 GiB | 6s |
 | 6. UV Unwrapping | CuMesh xatlas UV packing | 2.1 GiB | 5s |
