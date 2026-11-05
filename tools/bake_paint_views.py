@@ -6,6 +6,7 @@ import sys
 from concurrent.futures import Future
 from pathlib import Path
 import nvdiffrast.torch as dr
+import torch
 from paint_base import load_paint_base
 from PIL import Image
 
@@ -26,6 +27,12 @@ parser.add_argument('--colour-match-views', type=Path)
 args = parser.parse_args()
 cameras = json.loads(args.cameras.read_text())
 vertices, normals, uv, faces, flat = load_geometry(args.base, True)
+# Degenerate faces leave some stored normals non-finite, which the packer refuses, so those point up.
+broken = ~torch.isfinite(normals).all(1)
+if broken.any():
+    normals[broken] = 0.
+    normals[broken, 1] = 1.
+    print('NONFINITE_NORMALS_REPLACED', int(broken.sum()), flush=True)
 base_colour = load_paint_base(args.base, args.base_material).visual.material.baseColorTexture
 if args.base_colour:
     with Image.open(args.base_colour) as image:
