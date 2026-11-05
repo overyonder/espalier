@@ -63,7 +63,7 @@ Measured on an NVIDIA GeForce RTX 5070 Ti (16 GB VRAM) generating the benchmark 
 | Stage | Technology | Peak VRAM | Time |
 | --- | --- | --- | --- |
 | 1. Cutout | RMBG-2.0 | 2.4 GiB | 3s |
-| 2. Shape Generation | Hunyuan3D-2.1 (100 steps, octree 512, FlashVDM decode) | 12.8 GiB | 78s and up, with surface area |
+| 2. Shape Generation | Hunyuan3D-2.1 (100 steps, octree 512, FlashVDM decode) | 7.0 GiB | 78-95s |
 | 3. Surface Extraction | GPU Dual Marching Cubes (`diso`) | 4.2 GiB | 14s |
 | 4. Refinement | Hi3D v1.0 at 1024, one model on the GPU per phase | 4.5 GiB | 191s |
 | 5. Mesh Reduction | CuMesh cleaning & decimation (56k faces) | 3.8 GiB | 6s |
