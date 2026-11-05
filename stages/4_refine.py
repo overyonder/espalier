@@ -6,7 +6,7 @@ GPU reservation: condition, sample-0, decode-0, sample-1, decode-1 and so on, on
 
   python3 stages/4_refine.py <cutout.png> <dense.ply> <out_refined.ply> [--resolution 1024] [--seed 0] [--phase all]
 """
-import gc
+import ctypes, gc
 import argparse, os, time
 import torch, trimesh
 from PIL import Image
@@ -47,10 +47,12 @@ def report(phase, started):
 
 
 @torch.inference_mode()
-def release_all_but_the_decoder():
-    """The final mesh's extraction peaks at about 21 GiB of system memory on a 1024 grid, and only the decoder is used from here."""
-    pipeline.transformer_512 = pipeline.conditioner = pipeline._transformer_1024 = None
+def release(*models):
+    """Each pass holds tens of gigabytes of system memory at its peak, and earlier models aren't used again for this object."""
+    for name in models:
+        setattr(pipeline, name, None)
     gc.collect()
+    ctypes.CDLL("libc.so.6").malloc_trim(0)
 
 
 def condition_phase(cutout, dense_path, state):
@@ -106,8 +108,10 @@ def refine_mesh(cutout, dense_path, out):
         pipeline = load_pipeline()
     for phase in phases if a.phase == "all" else [a.phase]:
         started = time.time()
+        if phase == f"sample-{passes - 1}" and passes > 1:
+            release("conditioner", "transformer_512")
         if phase == f"decode-{passes - 1}":
-            release_all_but_the_decoder()
+            release("transformer_512", "conditioner", "_transformer_1024", "_transformer_1024_loader")
         torch.cuda.reset_peak_memory_stats()
         if phase == "condition":
             condition_phase(cutout, dense_path, state)
