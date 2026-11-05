@@ -47,12 +47,24 @@ def report(phase, started):
 
 
 @torch.inference_mode()
+def evict_weights_from_page_cache():
+    """The weights just read fill the page cache, and the final decode's large allocations would otherwise stall reclaiming them."""
+    hub = os.path.join(os.environ.get("HF_HOME", os.path.expanduser("~/.cache/huggingface")), "hub")
+    for name in ("models--hi3d-official--Hi3Dv1.0", "models--tencent--Hunyuan3D-2.1", "models--microsoft--TRELLIS.2-4B", "models--briaai--RMBG-2.0", "models--facebook--dinov3-vitl16-pretrain-lvd1689m"):
+        blobs = os.path.join(hub, name, "blobs")
+        for entry in os.scandir(blobs) if os.path.isdir(blobs) else ():
+            descriptor = os.open(entry.path, os.O_RDONLY)
+            os.posix_fadvise(descriptor, 0, 0, os.POSIX_FADV_DONTNEED)
+            os.close(descriptor)
+
+
 def release(*models):
     """Each pass holds tens of gigabytes of system memory at its peak, and earlier models aren't used again for this object."""
     for name in models:
         setattr(pipeline, name, None)
     gc.collect()
     ctypes.CDLL("libc.so.6").malloc_trim(0)
+    evict_weights_from_page_cache()
 
 
 def condition_phase(cutout, dense_path, state):
