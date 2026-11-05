@@ -5,6 +5,7 @@ import csv
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -68,9 +69,12 @@ cameras_path = progressive / 'cameras.json'
 if args.cameras and not cameras_path.is_file():
     shutil.copyfile(args.cameras, cameras_path)
 
-def run_tool(name, *arguments, interpreter=python, environment=None, limit=1800):
+# ESPALIER_GPU_COMMAND wraps each GPU tool, such as in a machine's queue, followed by its measured peak and the tool.
+gpu_command = shlex.split(os.environ.get('ESPALIER_GPU_COMMAND', ''))
+def run_tool(name, *arguments, interpreter=python, environment=None, limit=1800, gpu_mib=None):
     print('START', name, flush=True)
-    subprocess.run([interpreter, str(root/'tools'/name), *map(str, arguments)],
+    wrapper = [*gpu_command, f'{gpu_mib}MiB', '--'] if gpu_command and gpu_mib else []
+    subprocess.run([*wrapper, interpreter, str(root/'tools'/name), *map(str, arguments)],
                    check=True, env=environment, timeout=limit)
     print('DONE', name, flush=True)
 
@@ -78,14 +82,14 @@ material_arguments = ['--base-material', args.base_material] if args.base_materi
 reference_matched_base = progressive / 'base-reference-matched.png'
 base_colour_arguments = ['--base-colour', reference_matched_base] if match_base_to_reference else []
 def render_paint_inputs(*extra):
-    run_tool('render_paint_views.py', args.base, views, cameras_path, '--base', args.paint_base, *material_arguments, *base_colour_arguments, *extra, limit=300)
+    run_tool('render_paint_views.py', args.base, views, cameras_path, '--base', args.paint_base, *material_arguments, *base_colour_arguments, *extra, limit=300, gpu_mib=3072)
 
 # The painter receives the base already matched to the reference, so it adds detail rather than correcting colour.
 if match_base_to_reference and args.phase != 'paint' and not reference_matched_base.is_file():
     unmatched_views = progressive / 'views-unmatched'
     original_base = progressive / 'base-original.png'
     run_tool('render_paint_views.py', args.base, unmatched_views, cameras_path, '--base', args.paint_base, *material_arguments,
-             '--save-base-colour', original_base, limit=300)
+             '--save-base-colour', original_base, limit=300, gpu_mib=3072)
     subprocess.run([str(root / 'Intermediate/surfaces/match-base-colour'), str(original_base), str(cameras_path), str(unmatched_views),
                     str(args.colour_reference or args.reference), str(reference_matched_base), str(progressive / 'base-reference-match.toml')], check=True)
 
@@ -194,14 +198,14 @@ args.out.parent.mkdir(parents=True, exist_ok=True)
 projected_paintings = paintings
 if args.upscale:
     projected_paintings = progressive / f'gen-upscaled-{args.upscale}x'
-    run_tool('upscale.py', paintings, projected_paintings, '--factor', args.upscale, '--cameras', cameras_path,)
+    run_tool('upscale.py', paintings, projected_paintings, '--factor', args.upscale, '--cameras', cameras_path, gpu_mib=6800)
 grade_arguments = []
 if not args.no_base_colour_match:
     grade_views = views if args.paint_base == 'trellis' else progressive / 'grade-views'
     if args.paint_base != 'trellis':
-        run_tool('render_paint_views.py', args.base, grade_views, cameras_path, '--base', 'trellis', *material_arguments, limit=300)
+        run_tool('render_paint_views.py', args.base, grade_views, cameras_path, '--base', 'trellis', *material_arguments, limit=300, gpu_mib=3072)
     grade_arguments = ['--colour-match-views', grade_views]
-run_tool('bake_paint_views.py', args.base, cameras_path, projected_paintings, bake_directory, args.out, *material_arguments, *base_colour_arguments, *grade_arguments, limit=300)
+run_tool('bake_paint_views.py', args.base, cameras_path, projected_paintings, bake_directory, args.out, *material_arguments, *base_colour_arguments, *grade_arguments, limit=300, gpu_mib=6800)
 if args.texel_density_map:
     print('START texel density map', flush=True)
     prefix = args.out.with_name(args.out.stem + '-texel-density')
