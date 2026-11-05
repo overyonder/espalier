@@ -97,6 +97,12 @@ def decode_phase(index, dense_path, state, out):
     print(f"refined to {len(mesh.faces)} faces -> {out}", flush=True)
 
 
+def phase_result_exists(phase, state):
+    kind, _, index = phase.partition("-")
+    files = {"condition": ["condition.pt", "coords-0.pt"], "sample": [f"latents-{index}.pt"], "decode": [f"coords-{int(index) + 1}.pt"] if index and int(index) + 1 < passes else []}[kind]
+    return bool(files) and all(os.path.isfile(f"{state}/{name}") for name in files)
+
+
 def refine_mesh(cutout, dense_path, out):
     state = out + ".phases"
     os.makedirs(state, exist_ok=True)
@@ -108,6 +114,9 @@ def refine_mesh(cutout, dense_path, out):
         pipeline = load_pipeline()
     for phase in phases if a.phase == "all" else [a.phase]:
         started = time.time()
+        # A phase's result is kept, so an interrupted object carries on from where it stopped.
+        if a.phase == "all" and phase_result_exists(phase, state):
+            continue
         if phase == f"sample-{passes - 1}" and passes > 1:
             release("conditioner", "transformer_512")
         if phase == f"decode-{passes - 1}":
