@@ -49,7 +49,7 @@ def report(phase, started):
 @torch.inference_mode()
 def release_all_but_the_decoder():
     """The final mesh's extraction peaks at about 21 GiB of system memory on a 1024 grid, and only the decoder is used from here."""
-    pipeline.transformer_512 = pipeline.transformer_1024 = pipeline.conditioner = None
+    pipeline.transformer_512 = pipeline.conditioner = pipeline._transformer_1024 = None
     gc.collect()
 
 
