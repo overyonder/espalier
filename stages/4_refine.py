@@ -6,6 +6,7 @@ GPU reservation: condition, sample-0, decode-0, sample-1, decode-1 and so on, on
 
   python3 stages/4_refine.py <cutout.png> <dense.ply> <out_refined.ply> [--resolution 1024] [--seed 0] [--phase all]
 """
+import gc
 import argparse, os, time
 import torch, trimesh
 from PIL import Image
@@ -30,8 +31,13 @@ a = p.parse_args()
 print(f"== 4 refine (Hi3D v1.0, {a.resolution}, phase {a.phase})", flush=True)
 
 device = torch.device("cuda")
-pipeline = Sparc3DPipeline.from_pretrained(os.environ.get("ESPALIER_REFINE_MODEL", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "Hi3Dv1.0", "weights")))
-pipeline._device = device
+def load_pipeline():
+    loaded = Sparc3DPipeline.from_pretrained(os.environ.get("ESPALIER_REFINE_MODEL", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src", "Hi3Dv1.0", "weights")))
+    loaded._device = device
+    return loaded
+
+
+pipeline = load_pipeline()
 passes = OUTPUT_RESOLUTIONS.index(a.resolution) + 1
 
 
@@ -41,6 +47,12 @@ def report(phase, started):
 
 
 @torch.inference_mode()
+def release_all_but_the_decoder():
+    """The final mesh's extraction peaks at about 21 GiB of system memory on a 1024 grid, and only the decoder is used from here."""
+    pipeline.transformer_512 = pipeline.transformer_1024 = pipeline.conditioner = None
+    gc.collect()
+
+
 def condition_phase(cutout, dense_path, state):
     pipeline.conditioner.to(device)
     condition = pipeline.conditioner(prepare_image(Image.open(cutout)))
@@ -87,8 +99,15 @@ def refine_mesh(cutout, dense_path, out):
     state = out + ".phases"
     os.makedirs(state, exist_ok=True)
     phases = ["condition"] + [f"{kind}-{index}" for index in range(passes) for kind in ("sample", "decode")]
+    global pipeline
+    if pipeline.conditioner is None:
+        del pipeline
+        gc.collect()
+        pipeline = load_pipeline()
     for phase in phases if a.phase == "all" else [a.phase]:
         started = time.time()
+        if phase == f"decode-{passes - 1}":
+            release_all_but_the_decoder()
         torch.cuda.reset_peak_memory_stats()
         if phase == "condition":
             condition_phase(cutout, dense_path, state)
