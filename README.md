@@ -7,13 +7,18 @@ Earlier image-to-3D models attempted to generate geometry and surface textures i
 soft, blurry voxel textures and noisy geometry. Espalier-2.1 completely decouples geometry reconstruction from
 surface appearance and multi-view projection painting:
 
-1. **Precision Neural Shape**: Tencent's [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) generates a watertight 3D occupancy field at 100 flow matching steps and octree resolution 512, decoded near the surface with FlashVDM.
-2. **Dense Surface Extraction**: GPU Dual Marching Cubes (DMC via `diso`) extracts the manifold triangular surface.
-3. **Refinement**: [Hi3D v1.0](https://github.com/hi3d-official/Hi3Dv1.0) refines the dense surface against the reference image at a 1024 sparse grid.
-4. **Decimation & Repair**: CuMesh cleans duplicate geometry, fills holes, and decimates the refined mesh to a production-ready 56,000 face budget.
-5. **UV Unwrapping**: CuMesh and xatlas parameterize and pack clean UV charts into a standard 0–1 texture atlas.
-6. **Base PBR Albedo**: Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) is repurposed as a shape-conditioned voxel texturing engine, baking base color, roughness, and metallic into a 4096×4096 atlas without seams.
-7. **15-Camera Resident GPU Projection Painting**: Eight orbit views at 15°, four elevated views at 50°, and three underside views at -50° cover the model. GPU rendering and projection share the exact saved cameras. Each view is repainted against the reference, then all views are projected onto the 4096 atlas by the resident Vulkan baker with cosine-to-the-tenth weighting and BC7 encoding. The mesh, UVs and base PBR material are preserved.
+1. **Cutout**: RMBG-2.0 isolates the object from the reference image's background.
+2. **Precision Neural Shape**: Tencent's [Hunyuan3D-2.1](https://github.com/Tencent-Hunyuan/Hunyuan3D-2.1) generates a watertight 3D occupancy field at 100 flow matching steps and octree resolution 512, decoded near the surface with FlashVDM.
+3. **Dense Surface Extraction**: GPU Dual Marching Cubes (DMC via `diso`) extracts the manifold triangular surface.
+4. **Refinement**: [Hi3D v1.0](https://github.com/hi3d-official/Hi3Dv1.0) refines the dense surface against the reference image at a 1024 sparse grid.
+5. **Decimation & Repair**: CuMesh cleans duplicate geometry, fills holes, and decimates the refined mesh to a production-ready 56,000 face budget.
+6. **UV Unwrapping**: CuMesh and xatlas parameterize and pack clean UV charts into a standard 0–1 texture atlas.
+7. **Base PBR Albedo**: Microsoft's [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) is repurposed as a shape-conditioned voxel texturing engine, baking base color, roughness, and metallic into a 4096×4096 atlas without seams.
+8. **15-Camera Projection Painting**: Eight orbit views at 15°, four elevated views at 50°, and three underside views at -50° cover the model, and GPU rendering and projection share the exact saved cameras. The pass runs in three steps:
+   1. **Painting**: each view is repainted against the reference.
+   2. **Upscaling**: Real-ESRGAN enlarges each painting, 2× by default, so the projection has more source pixels per atlas texel.
+   3. **Projection**: the resident Vulkan baker projects all the upscaled views onto the 4096 atlas with cosine-to-the-tenth weighting and BC7 encoding. The mesh, UVs and base PBR material are preserved.
+9. **Restore Detail**: a subdivided copy of the painted model is displaced onto the refined dense surface for Nanite, on the same atlas, so every painted texel stays where it was.
 
 Every stage runs in an isolated child process, ensuring that CUDA contexts, model weights, and allocations are completely reclaimed by the operating system before the next stage begins.
 
