@@ -31,7 +31,10 @@ def accessor(document, binary, index):
     kind = {5125: "<u4", 5123: "<u2", 5121: "u1", 5126: "<f4"}[entry["componentType"]]
     size = {"SCALAR": 1, "VEC2": 2, "VEC3": 3}[entry["type"]]
     offset = view.get("byteOffset", 0) + entry.get("byteOffset", 0)
-    return np.frombuffer(binary, kind, entry["count"] * size, offset).reshape(-1, size).copy()
+    # The paint stage interleaves position, normal and texture coordinate in one view, so each element is a stride apart.
+    item = np.dtype(kind).itemsize
+    stride = view.get("byteStride", item * size)
+    return np.ndarray((entry["count"], size), kind, binary, offset, (stride, item)).copy()
 
 def subdivide(welded, faces, uvs, positions):
     """Splits every face in four. Wedges split per corner pair and positions per welded pair, so atlas seams stay seams."""
