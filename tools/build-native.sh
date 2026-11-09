@@ -8,7 +8,7 @@ mkdir -p "$output/resident-depth" "$output/surfaces"
 : "${CUDA_HOME:=$(dirname "$(dirname "$(command -v nvcc)")")}"
 export CARGO_TARGET_DIR="$output/resident-depth/shader-compiler"
 cargo build --locked --manifest-path "$root/tools/resident-depth/shader-compiler/Cargo.toml"
-header_flags=$(pkg-config --cflags vulkan libpng nlohmann_json)
+header_flags=$(pkg-config --cflags vulkan libpng nlohmann_json eigen3)
 library_flags=$(pkg-config --libs vulkan libpng)
 read -ra headers <<< "$header_flags"
 read -ra libraries <<< "$library_flags"
@@ -30,3 +30,7 @@ read -ra extra_libraries <<< "${LDFLAGS:-}"
 "$CXX" -std=c++20 -O2 -Wall -Wextra -Werror "${headers[@]}" "${extra_headers[@]}" \
     "$root/tools/match_base_colour.cpp" "${libraries[@]}" "${extra_libraries[@]}" \
     -o "$output/surfaces/match-base-colour"
+
+"$CXX" -std=c++20 -O2 -Wall -Wextra -Werror "${headers[@]}" "${extra_headers[@]}" \
+    "$root/tools/surface_regions.cpp" "${libraries[@]}" "${extra_libraries[@]}" \
+    -o "$output/surfaces/surface-regions"
