@@ -24,6 +24,7 @@ a = p.parse_args()
 from cumesh import cuBVH
 here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(here, "src", "TRELLIS.2"))
+import attention  # provides flash_attn to TRELLIS.2
 from trellis2.modules import image_feature_extractor
 from trellis2.pipelines import Trellis2TexturingPipeline
 if a.dinov3:

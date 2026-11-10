@@ -10,6 +10,7 @@ import ctypes, gc
 import argparse, os, time
 import torch, trimesh
 from PIL import Image
+import attention  # provides flash_attn to Hi3D
 from sparc3d import Sparc3DPipeline
 from sparc3d.nn.sparse.basic import SparseTensor
 from sparc3d.pipelines.sparc3d_pipeline import OUTPUT_RESOLUTIONS, PASS_BUDGETS, STRUCTURE_RESOLUTIONS, TARGET_FACE_COUNTS
