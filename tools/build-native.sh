@@ -18,7 +18,7 @@ read -ra extra_libraries <<< "${LDFLAGS:-}"
     "${headers[@]}" "${extra_headers[@]}" -I"$CUDA_HOME/include" \
     "$root/tools/resident-depth/vulkan_backend.cpp" "${libraries[@]}" "${extra_libraries[@]}" -lcuda \
     -o "$output/resident-depth/resident_vk.so"
-"$root/.venv/bin/python" "$root/tools/resident-depth/compile_shaders.py" \
+"${ESPALIER_PYTHON:-$root/.venv/bin/python}" "$root/tools/resident-depth/compile_shaders.py" \
     "$output/resident-depth" "$CARGO_TARGET_DIR/debug/object-shader-compile"
 "$CXX" -std=c++20 -O2 -Wall -Wextra -Werror "${headers[@]}" "${extra_headers[@]}" \
     -isystem "$root/tools/third-party/bcdec" "$root/tools/pack_generated.cpp" \
